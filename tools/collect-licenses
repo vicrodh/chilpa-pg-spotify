@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""I collect resolved dependency notices and the MPL dependency's source."""
+import argparse
+import io
+import json
+from pathlib import Path
+import subprocess
+import tarfile
+
+root = Path(__file__).resolve().parents[1]
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--metadata", type=Path)
+parser.add_argument("--platform", action="append", help="Limit license resolution to this Rust target (repeatable)")
+args = parser.parse_args()
+if args.metadata:
+    metadata = json.loads(args.metadata.read_text())
+else:
+    packages = {}
+    nodes = {}
+    for target in args.platform or ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]:
+        graph = json.loads(subprocess.check_output(["cargo", "metadata", "--locked", "--format-version", "1",
+            "--filter-platform", target, "--manifest-path", str(root / "Cargo.toml")]))
+        packages.update((package["id"], package) for package in graph["packages"])
+        nodes.update((node["id"], node) for node in graph["resolve"]["nodes"])
+    metadata = {"packages": list(packages.values()), "resolve": {"nodes": list(nodes.values())}}
+resolved = {node["id"] for node in metadata["resolve"]["nodes"]}
+notices = []
+for package in sorted(metadata["packages"], key=lambda p: (p["name"], p["version"])):
+    if package["id"] not in resolved or not package["source"]:
+        continue
+    folder = Path(package["manifest_path"]).parent
+    title = f"{package['name']} {package['version']}"
+    parts = [title, "=" * len(title), f"License: {package['license']}",
+        f"Source: https://crates.io/crates/{package['name']}/{package['version']}",
+        "Authors: " + ", ".join(package["authors"])]
+    files = [path for path in sorted(folder.iterdir()) if path.is_file()
+        and any(term in path.name.lower() for term in ("license", "licence", "copying", "notice", "copyright"))]
+    if package["name"] == "governor" and not files:
+        files = [root / "licenses/governor-MIT.txt"]
+    if package["name"] in {"objc2-core-foundation", "objc2-io-kit"} and not files:
+        parts.append("I select Apache-2.0. The licensing note is from objc2 revision 7b1abfd750a2cacaea71d6a56ecfb83cb7de560b.")
+        files = [root / "licenses/objc2-LICENSE.txt", root / "licenses/Apache-2.0.txt"]
+    if package["name"] == "priority-queue":
+        parts.append("I distribute this dependency under MPL-2.0. Its unchanged source is included as priority-queue-source.tar.gz.")
+        files = [root / "licenses/MPL-2.0.txt"]
+        with tarfile.open(root / "priority-queue-source.tar.gz", "w:gz") as archive:
+            for path in sorted(folder.rglob("*")):
+                if path.is_file():
+                    archive.add(path, arcname=f"priority-queue-{package['version']}/{path.relative_to(folder)}", recursive=False)
+    if not files:
+        raise SystemExit(f"Missing license text for {title}")
+    for path in files:
+        parts.extend([f"--- {path.name} ---", path.read_text(errors="replace")])
+    notices.append("\n".join(parts))
+(root / "THIRD-PARTY-NOTICES.txt").write_text("\n\n".join(notices) + "\n")
+print(f"Collected notices for {len(notices)} resolved registry dependencies.")

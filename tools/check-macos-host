@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""I load the exact macOS package in the existing host with a disposable profile."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import signal
+import subprocess
+import tempfile
+import time
+import zipfile
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("host", type=Path)
+parser.add_argument("package", type=Path)
+parser.add_argument("output", type=Path)
+args = parser.parse_args()
+if platform.system() != "Darwin":
+    parser.error("Run this check on macOS.")
+args.output.mkdir(parents=True, exist_ok=True, mode=0o700)
+with tempfile.TemporaryDirectory(prefix="spotify-macos-host-") as temporary:
+    profile = Path(temporary).resolve()
+    for name in ("config", "cache", "runtime", "data/chilpa/plugins"):
+        (profile / name).mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(args.package) as package:
+        manifest = json.loads(package.read("manifest.json"))
+        assert manifest["id"] == "app.chilpa.spotify" and manifest["runtime"] == "process"
+        folder = profile / "data/chilpa/plugins" / manifest["id"]
+        folder.mkdir()
+        for member in package.infolist():
+            assert not member.is_dir() and Path(member.filename).name == member.filename
+            (folder / member.filename).write_bytes(package.read(member))
+        (folder / "plugin").chmod(0o755)
+        expected_hash = hashlib.sha256(package.read("plugin")).hexdigest()
+    approval = {key: manifest.get(key) for key in ("kind", "runtime", "capabilities", "auth")}
+    (folder.parent / "approvals.json").write_text(json.dumps({manifest["id"]: approval}))
+    environment = dict(os.environ, XDG_CONFIG_HOME=str(profile / "config"), XDG_CACHE_HOME=str(profile / "cache"),
+        XDG_DATA_HOME=str(profile / "data"), XDG_RUNTIME_DIR=str(profile / "runtime"),
+        QT_QPA_PLATFORM="offscreen", CHILPA_RENDERER="software")
+    children = []
+    log_path = args.output / "macos-host.log"
+    with log_path.open("w") as log:
+        host = subprocess.Popen([str(args.host.resolve())], env=environment, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            # This older host has no external QML-smoke entry point. I check
+            # its actual isolated worker, without injecting or changing core.
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if host.poll() is not None:
+                    raise SystemExit("The macOS host exited before the package check completed.")
+                time.sleep(.1)
+            snapshot = subprocess.check_output(["/bin/ps", "-axo", "pid=,ppid=,comm="], text=True)
+            for line in snapshot.splitlines():
+                fields = line.strip().split(None, 2)
+                if len(fields) == 3 and fields[1] == str(host.pid) and fields[2] == str(folder / "plugin"):
+                    children.append(int(fields[0]))
+            if len(children) != 1:
+                raise SystemExit("The existing macOS host did not retain exactly one packaged plugin worker; inspect the private log.")
+            assert hashlib.sha256((folder / "plugin").read_bytes()).hexdigest() == expected_hash
+            print(json.dumps({"check":"macos_packaged_host", "version":manifest["version"],
+                "worker_alive":True,"exact_binary_sha256":expected_hash,"profile":"disposable"}))
+        finally:
+            host.terminate()
+            try:
+                host.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                host.kill()
+                host.wait()
+            for child in children:
+                try:
+                    os.kill(child, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+    text = log_path.read_text()
+    if any(error in text for error in ("QQmlApplicationEngine failed", "SMOKE FAIL", "is not a type")):
+        raise SystemExit("The macOS host reported a QML startup failure; inspect the private log.")
+    print("The existing macOS host loaded the exact package. Settings RPC is covered separately by protocol tests; this host has no QML smoke hook.")

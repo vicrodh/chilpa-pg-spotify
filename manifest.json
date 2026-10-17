@@ -1,0 +1,40 @@
+{
+  "id": "app.chilpa.spotify",
+  "name": "Spotify",
+  "version": "0.3.0",
+  "api_version": 1,
+  "kind": "source",
+  "runtime": "process",
+  "description": "Spotify for Linux and macOS hosts with native process plugins. Inspired by Spotifast by Carmine Paolino. A guided setup recommends a personal Client ID. Library and playback use separate browser approvals. Premium is required for audio. Credentials stay in private plugin storage. Includes discovery, playback and source lyrics through Chilpa's existing interfaces.",
+  "author": "vicrodh",
+  "icon": "icon.svg",
+  "folder_icon": "icon.svg",
+  "capabilities": [
+    {
+      "type": "network",
+      "domains": [
+        "accounts.spotify.com",
+        "api.spotify.com",
+        "api-partner.spotify.com",
+        "apresolve.spotify.com",
+        "clienttoken.spotify.com",
+        "spclient.wg.spotify.com",
+        "audio-fa.scdn.co",
+        "i.scdn.co",
+        "mosaic.scdn.co",
+        "image-cdn-ak.spotifycdn.com",
+        "image-cdn-fa.spotifycdn.com"
+      ]
+    },
+    {
+      "type": "register_source"
+    },
+    {
+      "type": "register_panel"
+    },
+    {
+      "type": "own_account",
+      "keyring": false
+    }
+  ]
+}

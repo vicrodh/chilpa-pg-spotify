@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""I check Discover endpoints with an existing grant, without changing account files."""
+import argparse
+import json
+import time
+from urllib.error import HTTPError, URLError
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, request, stream, code, message, headers, new_url):
+        return None
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("account")
+args = parser.parse_args()
+with open(args.account) as stream:
+    account = json.load(stream)
+if account.get("expires", 0) < time.time() + 30:
+    raise SystemExit("The saved access token needs a normal refresh in Chilpa before this read-only probe.")
+opener = build_opener(NoRedirect)
+for name, path, key in [
+    ("top_tracks", "/me/top/tracks?limit=5&time_range=short_term", None),
+    ("top_artists", "/me/top/artists?limit=5&time_range=medium_term", None),
+    ("new_albums_search", "/search?q=tag%3Anew&type=album&limit=10", "albums"),
+    ("lesser_known_albums_search", "/search?q=tag%3Ahipster&type=album&limit=10", "albums"),
+]:
+    request = Request("https://api.spotify.com/v1" + path,
+        headers={"Authorization": "Bearer " + account["access_token"], "User-Agent": "Chilpa-Spotify-Discover-Probe/0.1.2"})
+    try:
+        with opener.open(request, timeout=10) as response:
+            value = json.loads(response.read(8 * 1024 * 1024))
+            page = value.get(key, {}) if key else value
+            rows = page.get("items")
+            print(json.dumps({"endpoint": name, "status": response.status,
+                "items": len(rows) if isinstance(rows, list) else None,
+                "has_more": bool(page.get("next"))}))
+    except HTTPError as error:
+        seconds = error.headers.get("Retry-After", "")
+        print(json.dumps({"endpoint": name, "status": error.code,
+            "retry_after_seconds": int(seconds) if seconds.isdigit() else None}))
+        if error.code in (401, 429):
+            break
+    except (URLError, ValueError, OSError):
+        print(json.dumps({"endpoint": name, "status": "network_or_decode_error"}))
+        break

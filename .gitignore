@@ -1,0 +1,11 @@
+/target/
+/dist/
+/build/
+__pycache__/
+.env
+.env.*
+/account.json
+/rate-limit.json
+/shared-rate-limit.json
+/partner-rate-limit.json
+/playlist-requests.json

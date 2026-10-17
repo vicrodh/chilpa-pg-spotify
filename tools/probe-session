@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""I test session browsing while every public Web API call is paused, without playing audio."""
+import argparse
+import json
+import os
+from pathlib import Path
+import selectors
+import subprocess
+import tempfile
+import time
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('binary', type=Path)
+parser.add_argument('account', type=Path)
+args = parser.parse_args()
+account = json.loads(args.account.read_text())
+if not account.get('playback'):
+    raise SystemExit('An existing playback approval is required.')
+# I never renew or copy a renewable Web grant. Pathfinder uses the existing
+# account's Web token as context; its bearer and client token come from login5.
+# I freeze context expiry only in this disposable probe, including when the
+# live app's last Web token has expired during its long API pause.
+account['refresh_token'] = 'read-only-probe-never-refresh'
+account['expires'] = 2**63 - 1
+account['language'] = 'en'
+account['shared'] = None
+with tempfile.TemporaryDirectory(prefix='spotify-session-probe-') as temporary:
+    root = Path(temporary)
+    data = root / 'data'
+    data.mkdir(mode=0o700)
+    descriptor = os.open(data / 'account.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, 'w') as stream:
+        json.dump(account, stream)
+    (data / 'rate-limit.json').write_text(json.dumps({'version':1,'routes':{},'client_id':account['client_id'],'until':int(time.time())+86400}))
+    with subprocess.Popen([str(args.binary.resolve())], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, bufsize=1) as process:
+        watcher = selectors.DefaultSelector()
+        watcher.register(process.stdout,selectors.EVENT_READ)
+        identity = 0
+        failures = []
+        def call(method, params):
+            global identity
+            identity += 1
+            process.stdin.write(json.dumps({'jsonrpc':'2.0','id':identity,'method':method,'params':params})+'\n')
+            process.stdin.flush()
+            if not watcher.select(60):
+                raise SystemExit('The session probe timed out.')
+            reply = json.loads(process.stdout.readline())
+            value = reply.get('result',{})
+            print(json.dumps({'method':method,'ok':'result' in reply,'error':reply.get('error',{}).get('message'),
+                'home_fallback':value.get('home_fallback'),'personal':value.get('personal'),'items':len(value.get('items',[])),'tracks':len(value.get('tracks',[])),
+                'shelves':[{'kind':s.get('kind'),'count':len(s.get('items',[]))} for s in value.get('shelves',[])]}))
+            if 'result' not in reply:
+                failures.append(method)
+            return value
+        try:
+            call('initialize',{'protocol':1,'data_dir':str(data),'cache_dir':str(root/'cache')})
+            home = call('home',{})
+            cards = [card for shelf in home.get('shelves',[]) for card in shelf.get('items',[])]
+            selected = cards[0]['ref'] if cards else 'playlist:37i9dQZEVXbMDoHDwVN2tF'
+            call('page.get',{'ref':'discover:releases'})
+            playlist = call('playlist.get',{'ref':selected})
+            if playlist: assert playlist['tracks'] and any(row.get('album_ref') for row in playlist['tracks'])
+            call('playlist.get',{'ref':selected})
+            call('library.list',{'kind':'playlists','limit':5})
+            call('album.get',{'ref':'album:4aawyAB9vmqN3uQ7FjRGTy'})
+            artist = call('artist.get',{'ref':'artist:0TnOYISbd1XYRBk9myaseg'})
+            if artist: assert any(s['kind']=='album' and s['items'] for s in artist['shelves'])
+            radio = call('page.get',{'ref':'radio:artist:0TnOYISbd1XYRBk9myaseg'})
+            if radio:
+                assert radio['tracks'] and any(row.get('isrc') for row in radio['tracks'])
+                assert all(row.get('album_ref') for row in radio['tracks'])
+                repeated = call('page.get',{'ref':'radio:artist:0TnOYISbd1XYRBk9myaseg'})
+                assert repeated['tracks'] == radio['tracks']
+            call('track.get',{'ref':'track:0VjIjW4GlUZAMYd2vXMi3b'})
+            if failures: raise SystemExit('Session operations failed: ' + ', '.join(failures))
+            print('Session browsing passed with every public Web API route paused; no audio played.')
+        finally:
+            watcher.close()
+            process.terminate()
+            process.wait(timeout=5)

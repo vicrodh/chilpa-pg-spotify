@@ -1,0 +1,48 @@
+{
+  "spotifast": {
+    "repository": "crmne/spotifast",
+    "revision": "0b3e98087184fbda21ad4c720e220bd870148628",
+    "license": "MIT",
+    "author": "Carmine Paolino",
+    "adapted_paths": [
+      "src/auth.rs",
+      "src/api/client.rs",
+      "src/account_cache.rs",
+      "src/made_for_you.rs",
+      "src/session_reads.rs",
+      "src/player.rs",
+      "src/app/radio.rs",
+      "src/api/gateway.rs"
+    ]
+  },
+  "librespot": {
+    "repository": "crmne/librespot",
+    "revision": "ef27e124fe50b8519b5a5c6fa92c8f47f2544385",
+    "license": "MIT",
+    "archive_sha256": "ac78d557d2357db08dc818e4cc28f0be9cfcafb5ffd260ce9f63ca03271a4d1f"
+  },
+  "host": {
+    "revision": "0cb8a28814d1c1af1b053f2326146fdf35abcc43",
+    "api_version": 1,
+    "process_protocol": 1
+  },
+  "sdk": {
+    "tag": "protocol-4",
+    "revision": "edee9aeb704e44dbeb883036ef6dcd871e5df8f4",
+    "linked": false
+  },
+  "macos_host": {
+    "branch": "fix/macos-native-plugins",
+    "revision": "700a984977bb76ef857adeaeb32504814e64d51d",
+    "scope": "existing private native-plugin host; no core changes"
+  },
+  "macos_binding_licenses": {
+    "repository": "madsmtm/objc2",
+    "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+    "selected_license": "Apache-2.0",
+    "crates": [
+      "objc2-core-foundation",
+      "objc2-io-kit"
+    ]
+  }
+}

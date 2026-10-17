@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""I check real album/artist navigation with the Web API paused, without playing audio or changing the live account."""
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import time
+import zipfile
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("host", type=Path)
+parser.add_argument("package", type=Path)
+parser.add_argument("account", type=Path)
+parser.add_argument("output", type=Path)
+parser.add_argument("--search", action="store_true", help="Exercise native Search and legacy pause recovery")
+args = parser.parse_args()
+account = json.loads(args.account.read_text())
+if not account.get("playback"):
+    raise SystemExit("An existing playback approval is required for this read-only check.")
+account["refresh_token"] = "read-only-probe-never-refresh"
+account["expires"] = 2**63 - 1
+account["language"] = "en"
+account["shared"] = None
+args.output.mkdir(parents=True, exist_ok=True, mode=0o700)
+with tempfile.TemporaryDirectory(prefix="spotify-host-catalog-") as temporary:
+    profile = Path(temporary)
+    for name in ("config", "cache", "runtime", "data/chilpa/plugins"):
+        (profile / name).mkdir(parents=True, exist_ok=True)
+    (profile / "runtime").chmod(0o700)
+    with zipfile.ZipFile(args.package) as package:
+        manifest = json.loads(package.read("manifest.json"))
+        assert manifest["id"] == "app.chilpa.spotify" and manifest["runtime"] == "process"
+        folder = profile / "data/chilpa/plugins" / manifest["id"]
+        folder.mkdir()
+        for member in package.infolist():
+            assert not member.is_dir() and Path(member.filename).name == member.filename
+            (folder / member.filename).write_bytes(package.read(member))
+        (folder / "plugin").chmod(0o755)
+    data = profile / "data/chilpa/plugin-data" / manifest["id"]
+    data.mkdir(parents=True, mode=0o700)
+    descriptor = os.open(data / "account.json", os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(descriptor, "w") as stream:
+        json.dump(account, stream)
+    pause = {"client_id":account["client_id"],"until":int(time.time())+3600}
+    if not args.search:
+        pause.update(version=1, routes={})
+    (data / "rate-limit.json").write_text(json.dumps(pause))
+    approval = {key: manifest.get(key) for key in ("kind", "runtime", "capabilities", "auth")}
+    (folder.parent / "approvals.json").write_text(json.dumps({manifest["id"]: approval}))
+    fixture = Path(__file__).resolve().parents[1] / ("tests/host-search.qml" if args.search else "tests/host-catalog.qml")
+    smoke = profile / "catalog.qml"
+    smoke.write_text(fixture.read_text().replace('"PLUGIN_VERSION"', json.dumps(manifest["version"])))
+    environment = dict(os.environ, XDG_CONFIG_HOME=str(profile / "config"), XDG_CACHE_HOME=str(profile / "cache"),
+        XDG_DATA_HOME=str(profile / "data"), XDG_RUNTIME_DIR=str(profile / "runtime"),
+        QT_QPA_PLATFORM="offscreen", CHILPA_RENDERER="software", CHILPA_QML_SMOKE=str(smoke))
+    result = subprocess.run(["timeout", "--kill-after=2s", "55s", "dbus-run-session", "--", str(args.host.resolve())],
+        env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    (args.output / "catalog-host.log").write_text(result.stdout)
+    print("\n".join(line for line in result.stdout.splitlines() if "SMOKE" in line))
+    completed = "SMOKE Spotify search completed" if args.search else "SMOKE Spotify catalog completed"
+    if result.returncode or completed not in result.stdout or any(
+            error in result.stdout for error in ("SMOKE FAIL", "ReferenceError:", "TypeError:", "QQmlApplicationEngine failed", "is not a type")):
+        raise SystemExit("The catalog host check failed; inspect its private log.")
+    if args.search:
+        migrated = json.loads((data / "rate-limit.json").read_text())
+        assert migrated.get("catalogue_verified") and migrated.get("playlist_verified")
+        assert migrated.get("legacy_until", 0) >= pause["until"]
+        print("Legacy pause retained; catalogue and playlist searches verified independently.")

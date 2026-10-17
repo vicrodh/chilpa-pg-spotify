@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""I check live catalog RPC shapes in a disposable profile without exposing responses or credentials."""
+import argparse
+import json
+import os
+from pathlib import Path
+import selectors
+import subprocess
+import tempfile
+import time
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("binary", type=Path)
+parser.add_argument("account", type=Path)
+parser.add_argument("--lyrics", action="store_true", help="I also use the saved playback grant for a lyrics lookup, without playing audio")
+parser.add_argument("--session-catalog", action="store_true", help="I simulate a Web API pause in this disposable profile and test session album/artist lookups")
+args = parser.parse_args()
+account = json.loads(args.account.read_text())
+if not args.session_catalog and account.get("expires", 0) < time.time() + 120:
+    raise SystemExit("The saved access token needs a normal refresh in Chilpa before this read-only probe.")
+# I never copy a reusable refresh token; playback credentials require --lyrics.
+account["refresh_token"] = "read-only-probe-never-refresh"
+if not (args.lyrics or args.session_catalog):
+    account["playback"] = None
+with tempfile.TemporaryDirectory(prefix="spotify-catalog-probe-") as temporary:
+    data = Path(temporary) / "data"
+    data.mkdir(mode=0o700)
+    path = data / "account.json"
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w") as stream:
+        json.dump(account, stream)
+    if args.session_catalog:
+        (data / "rate-limit.json").write_text(json.dumps({"client_id":account["client_id"],"until":int(time.time())+3600}))
+    with subprocess.Popen([str(args.binary.resolve())], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1) as process:
+        watcher = selectors.DefaultSelector()
+        watcher.register(process.stdout, selectors.EVENT_READ)
+        try:
+            operations = [
+                ("initialize", {"protocol": 1, "data_dir": str(data), "cache_dir": temporary + "/cache"}),
+                ("album.get", {"ref": "album:4aawyAB9vmqN3uQ7FjRGTy"}),
+                ("page.get", {"ref": "album:4aawyAB9vmqN3uQ7FjRGTy"}),
+                ("artist.get", {"ref": "artist:0TnOYISbd1XYRBk9myaseg"}),
+                ("page.get", {"ref": "artist:0TnOYISbd1XYRBk9myaseg"}),
+            ]
+            if not args.session_catalog:
+                operations.append(("page.get", {"ref": "discover:home"}))
+            if args.lyrics:
+                operations.append(("track.lyrics", {"ref": "track:0VjIjW4GlUZAMYd2vXMi3b"}))
+            quota_reached = False
+            for identity, (method, params) in enumerate(operations, 1):
+                if quota_reached and method != "track.lyrics":
+                    continue
+                process.stdin.write(json.dumps({"jsonrpc": "2.0", "id": identity, "method": method, "params": params}) + "\n")
+                process.stdin.flush()
+                if not watcher.select(60):
+                    raise SystemExit("The plugin RPC timed out.")
+                reply = json.loads(process.stdout.readline())
+                value = reply.get("result", {})
+                quota_reached = quota_reached or "429" in reply.get("error", {}).get("message", "") or "rate limit" in reply.get("error", {}).get("message", "")
+                # Error messages from this plugin omit tokens, response bodies and account details.
+                print(json.dumps({"operation": method, "kind": params.get("ref", "").split(":")[0],
+                    "ok": "result" in reply, "error": reply.get("error", {}).get("message"),
+                    "tracks": len(value["tracks"]) if isinstance(value.get("tracks"), list) else None,
+                    "items": len(value["items"]) if isinstance(value.get("items"), list) else None,
+                    "lyrics_status": value.get("status"),
+                    "lyrics_lines": len(value.get("lyrics", {}).get("document", {}).get("lines", [])),
+                    "lyrics_timing": value.get("lyrics", {}).get("document", {}).get("timing"),
+                    "shelves": [{"kind": shelf.get("kind"), "items": len(shelf.get("items", []))}
+                        for shelf in value.get("shelves", [])]}))
+        finally:
+            watcher.close()
+            process.terminate()
+            process.wait(timeout=5)

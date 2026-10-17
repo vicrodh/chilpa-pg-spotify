@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""I check album and artist responses without printing account data or response bodies."""
+import argparse
+import json
+import time
+from urllib.error import HTTPError, URLError
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, request, stream, code, message, headers, new_url):
+        return None
+
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("account")
+args = parser.parse_args()
+with open(args.account) as stream:
+    account = json.load(stream)
+if account.get("expires", 0) < time.time() + 30:
+    raise SystemExit("The saved access token needs a normal refresh in Chilpa before this read-only probe.")
+opener = build_opener(NoRedirect)
+
+
+def get(name, path):
+    request = Request("https://api.spotify.com/v1" + path,
+        headers={"Authorization": "Bearer " + account["access_token"], "User-Agent": "Chilpa-Spotify-Catalog-Probe/0.1.2"})
+    try:
+        with opener.open(request, timeout=10) as response:
+            value = json.loads(response.read(8 * 1024 * 1024))
+            items = value.get("items")
+            embedded = value.get("tracks", {}).get("items")
+            print(json.dumps({"endpoint": name, "status": response.status,
+                "items": len(items) if isinstance(items, list) else None,
+                "embedded_tracks": len(embedded) if isinstance(embedded, list) else None,
+                "has_more": bool(value.get("next"))}))
+            return value
+    except HTTPError as error:
+        print(json.dumps({"endpoint": name, "status": error.code}))
+        if error.code in (401, 429):
+            raise SystemExit("I stopped further requests after an authorization or quota rejection.")
+    except (URLError, ValueError, OSError):
+        raise SystemExit("The probe stopped after a network or decoding error.")
+    return {}
+
+
+# I use public catalog IDs from Spotify's documentation, not private library contents.
+album = "4aawyAB9vmqN3uQ7FjRGTy"
+artist = "0TnOYISbd1XYRBk9myaseg"
+get("album_header", f"/albums/{album}")
+get("album_tracks_limit_50", f"/albums/{album}/tracks?limit=50&offset=0")
+get("artist_header", f"/artists/{artist}")
+get("artist_albums_limit_50", f"/artists/{artist}/albums?limit=50&offset=0")
+get("artist_albums_limit_10", f"/artists/{artist}/albums?limit=10&offset=0")

@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""I build and package a standalone Linux or macOS process plugin."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import struct
+import subprocess
+import sys
+import zipfile
+
+root = Path(__file__).resolve().parents[1]
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--target-dir", type=Path, default=root / "target")
+parser.add_argument("--binary", type=Path, help="Package an already built release executable")
+args = parser.parse_args()
+subprocess.run(["python3", str(root / "tools/verify-vendor")], check=True)
+if args.binary:
+    binary = args.binary.resolve()
+else:
+    build = ["cargo", "build", "--locked", "--release", "--manifest-path", str(root / "Cargo.toml"),
+        "--target-dir", str(args.target_dir)]
+    lock = Path("/mnt/build/tmp/blitzkriegfc/chilpa-cargo.lock")
+    capped = Path.home() / ".local/bin/cargo-capped"
+    if sys.platform.startswith("linux") and lock.parent.is_dir() and capped.is_file() and shutil.which("flock"):
+        build = ["flock", str(lock), str(capped), *build]
+    environment = dict(os.environ)
+    flags = (environment["CARGO_ENCODED_RUSTFLAGS"].split("\x1f")
+        if "CARGO_ENCODED_RUSTFLAGS" in environment else shlex.split(environment.get("RUSTFLAGS", "")))
+    flags.extend([f"--remap-path-prefix={Path.home()}=/usr/src/build",
+        f"--remap-path-prefix={root}=/usr/src/chilpa-pg-spotify"])
+    environment.pop("RUSTFLAGS", None)
+    environment["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(flags)
+    subprocess.run(build, check=True, env=environment)
+    binary = args.target_dir / "release/plugin"
+payload = binary.read_bytes()
+# I label the executable itself, including when --binary comes from another machine.
+if payload[:4] == b"\x7fELF" and payload[4:6] == b"\x02\x01":
+    architecture = {62: "x86_64", 183: "aarch64"}.get(struct.unpack_from("<H", payload, 18)[0])
+    system = "linux"
+elif payload[:4] == b"\xcf\xfa\xed\xfe":
+    architecture = {0x1000007: "x86_64", 0x100000c: "aarch64"}.get(struct.unpack_from("<I", payload, 4)[0])
+    system = "macos"
+else:
+    parser.error("The executable must be a 64-bit Linux ELF or macOS Mach-O binary.")
+if architecture is None:
+    parser.error("The executable architecture is not supported.")
+manifest = json.loads((root / "manifest.json").read_text())
+dist = root / "dist"
+dist.mkdir(exist_ok=True)
+package = dist / f"{manifest['id']}-{manifest['version']}-{system}-{architecture}.zip"
+licenses = "\n\n".join(f"{path.name}\n{'=' * len(path.name)}\n{path.read_text()}"
+    for path in sorted((root / "licenses").glob("*.txt")))
+with zipfile.ZipFile(package, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    for name in ["manifest.json", "icon.svg", "README.md", "LICENSE", "SOURCES.json", "Cargo.lock", "THIRD-PARTY-NOTICES.txt", "priority-queue-source.tar.gz"]:
+        archive.write(root / name, name)
+    info = zipfile.ZipInfo("plugin")
+    info.external_attr = (0o100755 << 16)
+    info.compress_type = zipfile.ZIP_DEFLATED
+    archive.writestr(info, payload)
+    archive.writestr("THIRD-PARTY-LICENSES.txt", licenses)
+digest = hashlib.sha256(package.read_bytes()).hexdigest()
+package.with_suffix(".zip.sha256").write_text(f"{digest}  {package.name}\n")
+print(package)
+print(f"SHA-256: {digest}")
