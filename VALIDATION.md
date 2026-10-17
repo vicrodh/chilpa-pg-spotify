@@ -4,18 +4,24 @@ I validated version 0.3.0 on 2026-10-16, using Rust 1.98.1 on Linux x86_64
 and Rust 1.96.0 on macOS 26.6.2 Apple Silicon. I changed only this plugin;
 I made no changes to Chilpa core, its UI, facade, SDK or vendored librespot.
 
+I rebuilt the public packages on 2026-10-17 with compiler paths remapped.
+Both binaries contain no local `/home/` or `/Users/` build paths. I repeated
+the ten executable protocol checks and exact-package host loading on each
+platform. Runtime source and dependency versions are unchanged from the
+64-test and live account validation on 2026-10-16.
+
 ## Packages
 
 | Target | ZIP bytes | Executable bytes |
 | --- | ---: | ---: |
-| Linux x86_64 | 3867863 | 9421448 |
-| macOS aarch64 | 3572964 | 8401728 |
+| Linux x86_64 | 3867989 | 9419016 |
+| macOS aarch64 | 3572743 | 8385216 |
 
-Linux ZIP SHA-256: `672d58df0265d5ca0f88cf8253e6a2136d4da78317f081923cc8e1305c16a029`.
-Linux executable SHA-256: `148f6c19d8502520d009490f2bcd79a5f89451e66b668369b56d6352a3dafd65`.
+Linux ZIP SHA-256: `bbeb71d071f29d29dbb28f21c18c2802db7bdcfb785fca3eea87df950423ee9b`.
+Linux executable SHA-256: `81c5e20d7dd77814e3c2e724e5e0c590ba01bfc63c859d84ec290159243818e3`.
 
-macOS ZIP SHA-256: `c869666d45ed51d333f923e54982ed26fe645c06bbd9235d7dda3077a31dd3dc`.
-macOS executable SHA-256: `9964faf281d6dc919a19cf468f1d3d8032240396c38cef95a9090e975e23a859`.
+macOS ZIP SHA-256: `bb7160f70595442df5f1900fc455f53de329a48655328ddb60ea4b665f5f959b`.
+macOS executable SHA-256: `828d0d008e6f4b0da6dc74185d824c9ec1721298a0fc9c7dc148a5ef47fe00af`.
 
 I checked both ZIPs have ten flat entries, version 0.3.0, executable permissions,
 matching binary hashes and SHA-256 sidecars, identical README, lockfile and source
