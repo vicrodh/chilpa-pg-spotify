@@ -4,7 +4,7 @@ Spotify search, library, discovery and playback through Chilpa's native process
 plugin API. All provider code and account handling live in this repository;
 no changes to Chilpa core, UI or SDK are required.
 
-I publish this plugin independently as [vicrodh](https://github.com/vicrodh).
+This plugin is independently maintained by [vicrodh](https://github.com/vicrodh).
 Source and platform packages are available in
 [chilpa-pg-spotify](https://github.com/vicrodh/chilpa-pg-spotify).
 The SDK includes it as a [native source example](https://github.com/vicrodh/chilpa-plugins-sdk/blob/main/wiki/Native-Plugins.md#native-source-example).
