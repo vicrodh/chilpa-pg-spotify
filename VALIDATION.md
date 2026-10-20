@@ -1,5 +1,136 @@
 # Validation
 
+## Library enrichment 0.3.4 (phase 4)
+
+Validated on 2026-10-20 using repository source, inline protobuf fixtures and
+loopback HTTP only. No public downloads, authenticated service calls, owner
+account files, private diagnostic/cache files or environment files were read.
+The supplied live counts are user-provided evidence: all three partner operations
+returned 403, Home also returned 403, and extended metadata still worked.
+
+### Routes and static evidence
+
+Labels and composer credits now share the playback session's
+`POST /extended-metadata/v0/extended-metadata` transport in
+`src/session_enrichment.rs:83`. The vendored implementation is
+`vendor/librespot/core/src/spclient.rs:583`; session authentication is attached
+at lines 497 and 511. The same transport is already used by
+`src/native_catalog.rs:223`. It needs no partner operation hash.
+
+- Labels: `src/session_labels.rs:88` parses the album protobuf;
+  `src/session_labels.rs:227` selects `ALBUM_V4` (9). The vendored mapping is
+  `vendor/librespot/core/src/spclient.rs:637`; `metadata.proto:50` defines
+  `label = 5` and line 57 defines `copyright = 13`.
+  `vendor/librespot/metadata/src/album.rs:32` exposes the same label.
+  A nonblank protobuf label wins; otherwise `owner()` is applied to the first
+  P-type copyright only. C-only copyright is not a label. Library track rows
+  resolve their `album_ref`, sharing the same per-album cache with album rows.
+  Existing labels survive; refreshed enrichment records `label_source` as
+  `metadata` or `copyright`. The partner `getAlbum` route was removed.
+- Credits: `src/session_credits.rs:133` reads only explicit composer roles from
+  `TRACK_V4` (10), selected at line 291. The vendored mapping is
+  `vendor/librespot/core/src/spclient.rs:628`.
+  `vendor/librespot/protocol/proto/metadata.proto:94` defines track
+  `artist_with_role = 32`; lines 106, 112 and 113 define composer role 5,
+  artist name and role. Names retain response order and are deduplicated.
+  The schema establishes composers, not comprehensive songwriter or lyricist
+  coverage. `extension_kind.proto:110`, `:144` and `:199` also name
+  `TRACK_EXTENDED_CREDITS`, `CREDITS_TRAIT` and `CREDITS_V2_TRAIT`, but this vendor
+  contains no corresponding payload schema. The separate experimental
+  `track-credits-view` JSON route has no vendored implementation or contract;
+  it was not selected or claimed to work. The existing metadata route provides
+  a concrete protobuf contract without inventing a JSON response. Both partner
+  enrichment queries are gone. Whether actual tracks populate composer roles
+  remains unverified.
+- Genres: `src/catalog.rs:547` retains the Web API single-artist fallback after
+  batch 403/404, and during a batch 403 cooldown. The vendored Artist and Album
+  messages (`metadata.proto:11` and `:33`) contain no genres. No alternative
+  music-genre source was established. Missing fields stay uncached; explicit
+  arrays, including empty arrays, retain the 30-day cache. No genres are inferred.
+  The old aggregate diagnostic cannot prove which response the live fallback
+  received; the supplied counts alone cannot resolve this. Local fixtures prove
+  that it runs and separately records 403, 404, success, malformed data and timeout.
+
+The vendored batch request is a repeated `entity_request`
+(`vendor/librespot/protocol/proto/extended_metadata.proto:33`). Neither that schema
+nor `get_extended_metadata` declares a numerical server limit. The existing
+catalog implementation uses chunks of 50 (`src/native_catalog.rs:208`); enrichment
+uses one batch of at most 20 entities, below that existing bound. No larger server
+limit is claimed. Each feature keeps its six-second deadline, including gates
+and session setup. `album-label:v2` and `track-credits:v2` intentionally leave old
+empty answers behind. Found answers last 90 days and empty answers seven days.
+Known album-track membership and rotating continuation remain supported.
+
+### Refusals and diagnostics
+
+`src/enrichment.rs:104` and `:130` implement account-scoped route pauses using
+`capability:enrichment:<route>`. A 403 stores `until = now + 3600`; an in-memory
+copy also prevents repeats when snapshot writes fail. The session endpoint has
+one shared pause for both extension kinds. Its gate prevents concurrent label
+and credit calls from racing past a refusal. HTTP status, provider status and
+per-entity status are checked. Successful siblings are usable, while failed or
+malformed rows are never cached as empty answers. HTTP 429 also stops requests
+and keeps a short pause; Web API handling continues to honor its existing
+Retry-After state.
+
+Web API routes `artist_genres` and `artist_genres_single` pause independently,
+so the first batch refusal still permits a single-artist fallback. A single
+403 stops that fallback immediately. Pauses survive restart, expire after the
+hour and do not cross accounts. These pauses apply to enrichment only and do
+not suppress playback or ordinary catalog metadata.
+
+`library-enrichment:v1` now has four independent entries:
+`album_label`, `track_credits`, `artist_genres`, `artist_genres_single`.
+Each entry retains `at`, `asked`, `with_data`, `cached`, and `outcome`.
+`asked` counts submitted entities, not HTTP packets. Genre batch counts no
+longer include single-artist attempts. First refusals record
+`{"class":"http","status":403}`. Subsequent skipped calls record
+`{"class":"disabled","remaining":3599}` with `asked: 0` and current remaining
+seconds. Fresh cached answers still apply. A fallback that did not run records
+`not_attempted`; cache-only and candidate-free calls use `cache_hit` and
+`no_candidates`. No IDs, names, response bodies, headers or tokens enter the
+diagnostic. Legacy GraphQL outcome types remain readable solely for merging old
+entries until each feature runs again.
+
+Version is 0.3.4 in the manifest, Cargo package and lockfile. Manifest network
+permissions, dependencies, vendor pins, SDK and process/API contracts are
+unchanged. `api-partner.spotify.com` remains needed by the existing Home feature.
+The historical 0.3.3 investigation below describes the superseded enrichment.
+
+### Final checks and package
+
+```text
+Verified 666 vendored source files.
+test result: ok. 109 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.86s
+Finished `release` profile [optimized] target(s) in 23.59s
+Ran 10 tests in 0.403s
+OK
+ZIP verification passed: 10 entries, CRC, sidecar, version, executable mode, packaged files and binary.
+```
+
+The Rust suite ran after `python3 tools/verify-vendor` using
+`flock /mnt/build/tmp/blitzkriegfc/chilpa-cargo.lock $HOME/.local/bin/cargo-capped cargo test --locked --bin plugin`.
+All Cargo commands used the shared lock and capped wrapper, in the foreground,
+one at a time, with `CARGO_NET_OFFLINE=true`. The sole ignored test requires
+explicit live-account access and was not run. The vendored lint-expectation
+warning and four existing release unused-import/helper warnings remain.
+
+`CARGO_NET_OFFLINE=true python3 tools/build-native` produced
+`dist/app.chilpa.spotify-0.3.4-linux-x86_64.zip`, SHA-256:
+
+```text
+5d8b5bcf920c80c4235835078aa7555ad9b4c6f90b3b0f31f0ca6106c38dcaac
+```
+
+The ten protocol tests used the executable extracted from this exact ZIP and
+temporary profiles. Packaged binary, manifest, README, Cargo lockfile, source
+pins, icon, license and attribution files matched the repository/build output.
+The binary contains no owner home-directory build path. No live installation
+or host loading check was performed. Actual labels, composer-role population,
+writer/lyricist completeness, single-artist genre availability, and Chilpa field
+display remain unverified without a live account. These local fixtures establish
+parsing, limits, caches, diagnostics and cooldowns, not returned live data.
+
 ## Library enrichment 0.3.3
 
 Investigated on 2026-10-20 from repository source and unauthenticated public player

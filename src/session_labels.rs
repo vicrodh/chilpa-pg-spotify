@@ -1,19 +1,20 @@
 use crate::{
     auth::Client,
-    enrichment::{Attempt, Outcome, TimeoutStage, is_disabled_error, record, stops_requests},
+    enrichment::{Attempt, Outcome, TimeoutStage, record},
     state::{now, reference, text},
 };
+use librespot_core::SpotifyId;
+use librespot_protocol::{extension_kind::ExtensionKind, metadata};
+use protobuf::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
-    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 use tokio::time::{Instant, timeout_at};
 
-const HASH: &str = "0b6ce3511e1b02e4a40fa95440f992acbe85080eb308af9194322d708fc1914f";
-const CACHE_KEY: &str = "album-label:v1";
+const CACHE_KEY: &str = "album-label:v2";
 const FOUND_TTL: u64 = 90 * 24 * 60 * 60;
 const EMPTY_TTL: u64 = 7 * 24 * 60 * 60;
 const REQUEST_LIMIT: usize = 20;
@@ -23,6 +24,14 @@ const TIME_LIMIT: Duration = Duration::from_secs(6);
 struct Label {
     at: u64,
     label: Option<String>,
+    source: LabelSource,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LabelSource {
+    Metadata,
+    Copyright,
 }
 
 impl Label {
@@ -52,66 +61,60 @@ impl Cache {
             let Some(id) = album_id(item) else {
                 continue;
             };
-            if let Some(label) = self
+            if let Some(entry) = self
                 .albums
                 .get(&id)
                 .filter(|entry| entry.fresh(now()))
-                .and_then(|entry| entry.label.as_ref())
+                .filter(|entry| entry.label.is_some())
             {
-                item["label"] = json!(label);
-                item["label_source"] = json!("copyright");
+                item["label"] = json!(entry.label);
+                item["label_source"] = json!(entry.source);
             }
         }
     }
 }
 
 fn album_id(item: &Value) -> Option<String> {
-    reference(text(item, "ref"), Some("album"))
+    let reference_value = if reference(text(item, "ref"), Some("track")).is_ok() {
+        text(item, "album_ref")
+    } else {
+        text(item, "ref")
+    };
+    reference(reference_value, Some("album"))
         .ok()
         .map(|(_, id)| id)
 }
 
-fn query(id: &str) -> Value {
-    json!({
-        "operationName":"getAlbum",
-        "variables":{"uri":format!("spotify:album:{id}"),"locale":"","offset":0,"limit":50},
-        "extensions":{"persistedQuery":{"version":1,"sha256Hash":HASH}}
-    })
-}
-
-fn parse(value: &Value) -> Result<Option<String>, Outcome> {
-    let album = value
-        .pointer("/data/albumUnion")
-        .filter(|album| album["__typename"] == "Album")
-        .ok_or(Outcome::UnexpectedShape)?;
-    let items = album
-        .pointer("/copyright/items")
-        .and_then(Value::as_array)
-        .ok_or(Outcome::UnexpectedShape)?;
-    let mut phonographic = Vec::new();
-    let mut copyright = Vec::new();
-    for item in items {
-        let line = item["text"]
-            .as_str()
-            .filter(|line| !line.trim().is_empty())
-            .ok_or(Outcome::UnexpectedShape)?;
-        let lines = match item["type"].as_str() {
-            Some("P") => &mut phonographic,
-            Some("C") => &mut copyright,
-            _ => return Err(Outcome::UnexpectedShape),
-        };
-        if !lines.contains(&line) {
-            lines.push(line);
-        }
+fn parse(id: &str, bytes: &[u8]) -> Result<Label, Outcome> {
+    let album = metadata::Album::parse_from_bytes(bytes).map_err(|_| Outcome::UnexpectedShape)?;
+    if SpotifyId::from_raw(album.gid())
+        .map(|gid| gid.to_base62())
+        .ok()
+        .as_deref()
+        != Some(id)
+    {
+        return Err(Outcome::UnexpectedShape);
     }
-    let lines = if phonographic.is_empty() {
-        copyright
+    let direct = album.label().trim();
+    let (label, source) = if !direct.is_empty() {
+        (Some(direct.to_owned()), LabelSource::Metadata)
     } else {
-        phonographic
+        let label = album
+            .copyright
+            .iter()
+            .find(|line| {
+                line.type_
+                    .is_none_or(|kind| kind.enum_value().ok() == Some(metadata::copyright::Type::P))
+            })
+            .map(|line| owner(line.text()))
+            .filter(|name| !name.is_empty());
+        (label, LabelSource::Copyright)
     };
-    // The label is who owns the recording: the first line, without its mark
-    // and its years.
-    Ok(lines.first().map(|line| owner(line)).filter(|name| !name.is_empty()))
+    Ok(Label {
+        at: now(),
+        label,
+        source,
+    })
 }
 
 /// "℗ 2017 JKP GmbH & Co. KG" as "JKP GmbH & Co. KG".
@@ -122,10 +125,16 @@ fn owner(line: &str) -> String {
             rest = after.trim_start();
         }
     }
-    while rest.len() >= 4 && rest.as_bytes()[..4].iter().all(u8::is_ascii_digit)
-        && rest.as_bytes().get(4).is_none_or(|next| !next.is_ascii_digit())
+    while rest.len() >= 4
+        && rest.as_bytes()[..4].iter().all(u8::is_ascii_digit)
+        && rest
+            .as_bytes()
+            .get(4)
+            .is_none_or(|next| !next.is_ascii_digit())
     {
-        rest = rest[4..].trim_start_matches(|c: char| c == '-' || c == '\u{2013}' || c == ',' || c == '/' || c.is_whitespace());
+        rest = rest[4..].trim_start_matches(|c: char| {
+            c == '-' || c == '\u{2013}' || c == ',' || c == '/' || c.is_whitespace()
+        });
     }
     rest.trim().to_string()
 }
@@ -142,14 +151,16 @@ impl Client {
     }
 
     pub(crate) async fn library_labels(&self, value: &mut Value) {
-        self.labels_until(value, Instant::now() + TIME_LIMIT, &self.labels_disabled)
-            .await;
+        self.labels_until(value, Instant::now() + TIME_LIMIT).await;
     }
 
-    async fn labels_until(&self, value: &mut Value, deadline: Instant, disabled: &AtomicBool) {
+    async fn labels_until(&self, value: &mut Value, deadline: Instant) {
         let mut attempt = Attempt::start();
         for item in value["items"].as_array_mut().into_iter().flatten() {
-            if item["label_source"] == "copyright" {
+            if matches!(
+                item["label_source"].as_str(),
+                Some("copyright" | "metadata")
+            ) {
                 if let Some(item) = item.as_object_mut() {
                     item.remove("label");
                     item.remove("label_source");
@@ -205,59 +216,41 @@ impl Client {
         }
         if missing.is_empty() {
             attempt.outcome = Outcome::CacheHit;
-        } else if disabled.load(Ordering::Relaxed) {
-            attempt.outcome = Outcome::Disabled;
         } else {
-            match self.enrichment_tokens(deadline).await {
-                Err(outcome) => attempt.fail(outcome),
-                Ok(tokens) => {
-                    for id in missing.iter().take(REQUEST_LIMIT) {
-                        if Instant::now() >= deadline {
-                            attempt.fail(Outcome::Timeout {
-                                stage: TimeoutStage::Request,
-                            });
-                            break;
-                        }
-                        if disabled.load(Ordering::Relaxed) {
-                            attempt.fail(Outcome::Disabled);
-                            break;
-                        }
-                        let request = async {
-                            if self.partner_limits.lock().await.remaining("/album-label") > 0 {
-                                return Err(Outcome::Http { status: 429 });
-                            }
-                            attempt.asked += 1;
-                            saved.after = Some(id.clone());
-                            let value = self
-                                .enrichment_query(&query(id), &tokens, "/album-label")
-                                .await?;
-                            parse(&value)
-                        };
-                        let result =
-                            timeout_at(deadline, request)
-                                .await
-                                .unwrap_or(Err(Outcome::Timeout {
-                                    stage: TimeoutStage::Request,
-                                }));
-                        match result {
+            let selected: Vec<_> = missing.iter().take(REQUEST_LIMIT).collect();
+            let uris: Vec<_> = selected
+                .iter()
+                .map(|id| format!("spotify:album:{id}"))
+                .collect();
+            match self
+                .enrichment_metadata(
+                    &identity,
+                    ExtensionKind::ALBUM_V4,
+                    &uris,
+                    deadline,
+                    &mut attempt,
+                )
+                .await
+            {
+                Ok(mut rows) => {
+                    for (id, uri) in selected.iter().zip(&uris) {
+                        match rows
+                            .remove(uri)
+                            .unwrap_or(Err(Outcome::UnexpectedShape))
+                            .and_then(|bytes| parse(id, &bytes))
+                        {
                             Ok(label) => {
-                                attempt.with_data += usize::from(label.is_some());
-                                saved.albums.insert(id.clone(), Label { at: now(), label });
+                                attempt.with_data += usize::from(label.label.is_some());
+                                saved.albums.insert((*id).clone(), label);
                             }
-                            Err(outcome) => {
-                                if is_disabled_error(&outcome) {
-                                    disabled.store(true, Ordering::Relaxed);
-                                }
-                                attempt.fail(outcome);
-                                if stops_requests(&outcome)
-                                    || matches!(outcome, Outcome::Timeout { .. })
-                                {
-                                    break;
-                                }
-                            }
+                            Err(outcome) => attempt.fail(outcome),
                         }
                     }
                 }
+                Err(outcome) => attempt.fail(outcome),
+            }
+            if attempt.asked > 0 {
+                saved.after = selected.last().map(|id| (*id).clone());
             }
         }
         saved.apply(value);
@@ -271,404 +264,264 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread::JoinHandle;
-    use tiny_http::{Header, Method, Response, Server, StatusCode};
-
-    fn id(index: usize) -> String {
-        format!("{index:022}")
-    }
+    use crate::fixtures::{
+        album_metadata, enrichment_diagnostic as diagnostic, id, metadata_client, metadata_reply,
+    };
 
     fn album(index: usize) -> Value {
-        json!({"kind":"album","ref":format!("album:{}", id(index)),"title":"Fixture album"})
+        json!({"kind":"album","ref":format!("album:{}",id(index))})
     }
 
-    fn reply(items: Value) -> Value {
-        json!({"data":{"albumUnion":{
-            "__typename":"Album","copyright":{"items":items,"totalCount":items.as_array().map(Vec::len)},
-            "courtesyLine":null
-        }}})
-    }
-
-    fn found() -> String {
-        reply(json!([{"type":"P","text":"2026 Example Records"}])).to_string()
-    }
-
-    #[tokio::test]
-    async fn album_library_fills_labels_on_cached_pages() {
-        let (client, _directory, worker) = fixture(vec![(200, found(), Duration::ZERO)]).await;
-        let identity = client.identity().await.unwrap();
-        client
-            .snapshots
-            .put(
-                &identity,
-                "library:albums:0:50:fields-v2",
-                json!({"items":[album(1)],"total":1}),
-            )
-            .unwrap();
-        let params = json!({"kind":"albums"});
-        let first = client.library(&params).await.unwrap();
-        assert_eq!(first["items"][0]["label"], "Example Records");
-        assert_eq!(first["items"][0]["label_source"], "copyright");
-        assert_eq!(client.library(&params).await.unwrap(), first);
-        let diagnostic = client
-            .snapshots
-            .peek(&identity, crate::enrichment::KEY)
-            .unwrap();
-        assert_eq!(diagnostic["album_label"]["outcome"]["class"], "cache_hit");
-        assert_eq!(diagnostic.as_object().unwrap().len(), 3);
-        assert_eq!(worker.join().unwrap().len(), 1);
-    }
-
-    async fn fixture(
-        replies: Vec<(u16, String, Duration)>,
-    ) -> (Client, tempfile::TempDir, JoinHandle<Vec<Value>>) {
-        let (mut client, directory, worker) = crate::fixtures::client(vec![]).await;
-        assert!(worker.join().unwrap().is_empty());
-        let server = Server::http("127.0.0.1:0").unwrap();
-        client.partner_fixture = Some(format!(
-            "http://{}/pathfinder/v2/query",
-            server.server_addr()
-        ));
-        let worker = std::thread::spawn(move || {
-            let mut queries = Vec::new();
-            for (status, body, delay) in replies {
-                let mut request = server
-                    .recv_timeout(Duration::from_secs(3))
-                    .unwrap()
-                    .expect("expected album request");
-                assert_eq!(request.method(), &Method::Post);
-                assert_eq!(request.url(), "/pathfinder/v2/query");
-                for (name, expected) in [
-                    ("Authorization", "Bearer fixture-access"),
-                    ("client-token", "fixture-client"),
-                    ("spotify-app-version", "896000000"),
-                ] {
-                    assert!(request.headers().iter().any(|header| {
-                        header.field.equiv(name) && header.value.as_str() == expected
-                    }));
-                }
-                let value: Value = serde_json::from_reader(request.as_reader()).unwrap();
-                let uri = value["variables"]["uri"].as_str().unwrap();
-                let album_id = uri.strip_prefix("spotify:album:").unwrap();
-                assert_eq!(value, query(album_id));
-                queries.push(value);
-                std::thread::sleep(delay);
-                let _ = request.respond(
-                    Response::from_string(body)
-                        .with_status_code(StatusCode(status))
-                        .with_header(Header::from_bytes("Retry-After", "60").unwrap()),
-                );
-            }
-            assert!(
-                server
-                    .recv_timeout(Duration::from_millis(50))
-                    .unwrap()
-                    .is_none(),
-                "unexpected extra album request"
-            );
-            queries
-        });
-        (client, directory, worker)
-    }
-
-    async fn diagnostic(client: &Client) -> Value {
-        client
-            .snapshots
-            .peek(&client.identity().await.unwrap(), crate::enrichment::KEY)
-            .unwrap()["album_label"]
-            .clone()
-    }
-
-    async fn save(client: &Client, entries: Vec<(usize, u64, Option<&str>)>) {
-        let saved = Cache {
-            albums: entries
+    fn reply(indices: impl IntoIterator<Item = usize>) -> Vec<u8> {
+        metadata_reply(
+            ExtensionKind::ALBUM_V4,
+            indices
                 .into_iter()
-                .map(|(index, at, label)| {
-                    (
-                        id(index),
-                        Label {
-                            at,
-                            label: label.map(str::to_owned),
-                        },
-                    )
-                })
+                .map(|i| (i, 200, album_metadata(i, "Example Records", &[])))
                 .collect(),
-            after: None,
-        };
-        client
-            .snapshots
-            .put(&client.identity().await.unwrap(), CACHE_KEY, json!(saved))
-            .unwrap();
+        )
     }
 
     #[test]
-    fn the_label_is_the_recording_owner_and_never_inferred_from_courtesy() {
-        assert_eq!(
-            parse(&reply(json!([
-                {"type":"C","text":"2025 Other owner"},
-                {"type":"P","text":"2026 Example Records"},
-                {"type":"P","text":"2026 Second owner"},
-                {"type":"P","text":"2026 Example Records"}
-            ]))),
-            Ok(Some("Example Records".into()))
-        );
-        assert_eq!(
-            parse(&reply(
-                json!([{"type":"C","text":" 2026 Example Records "}])
-            )),
-            Ok(Some("Example Records".into()))
-        );
-        for (line, owner) in [("\u{2117} 2017 JKP GmbH & Co. KG", Some("JKP GmbH & Co. KG")), ("(P) 2010-2012 Example", Some("Example")),
-            ("\u{a9} 2019, 2020 4AD Ltd", Some("4AD Ltd")), ("2017", None)] {
-            assert_eq!(parse(&reply(json!([{"type":"P","text":line}]))), Ok(owner.map(String::from)), "{line}");
-        }
-        let mut empty = reply(json!([]));
-        empty["data"]["albumUnion"]["courtesyLine"] = json!("Courtesy of an artist");
-        assert_eq!(parse(&empty), Ok(None));
-        for value in [
-            json!({}),
-            json!({"data":{"albumUnion":{"__typename":"NotFound"}}}),
-            json!({"data":{"albumUnion":{"__typename":"Album"}}}),
-            reply(json!({})),
-            reply(json!([{"type":"P"}])),
-            reply(json!([{"type":"P","text":" "}])),
-            reply(json!([{"type":"future","text":"Example Records"}])),
+    fn protobuf_label_precedes_the_first_phonographic_owner() {
+        let lines = [
+            ("2025 Other copyright", false),
+            ("℗ 2017 JKP GmbH & Co. KG", true),
+            ("2026 Second owner", true),
+        ];
+        let direct = parse(&id(1), &album_metadata(1, "  Label  ", &lines)).unwrap();
+        assert_eq!(direct.label.as_deref(), Some("Label"));
+        assert!(matches!(direct.source, LabelSource::Metadata));
+        let fallback = parse(&id(1), &album_metadata(1, "  ", &lines)).unwrap();
+        assert_eq!(fallback.label.as_deref(), Some("JKP GmbH & Co. KG"));
+        assert!(matches!(fallback.source, LabelSource::Copyright));
+        for lines in [
+            vec![],
+            vec![("2026 Copyright only", false)],
+            vec![("2017", true), ("2026 Second owner", true)],
         ] {
-            assert_eq!(parse(&value), Err(Outcome::UnexpectedShape));
+            assert!(
+                parse(&id(1), &album_metadata(1, "", &lines))
+                    .unwrap()
+                    .label
+                    .is_none()
+            );
+        }
+        for (line, expected) in [
+            ("(P) 2010-2012 Example", "Example"),
+            ("© 2019, 2020 4AD Ltd", "4AD Ltd"),
+            ("2017", ""),
+        ] {
+            assert_eq!(owner(line), expected);
+        }
+        // Proto2 defaults an omitted copyright type to P.
+        let mut album = metadata::Album::parse_from_bytes(&album_metadata(
+            1,
+            "",
+            &[("2026 Default owner", true)],
+        ))
+        .unwrap();
+        album.copyright[0].clear_type_();
+        assert_eq!(
+            parse(&id(1), &album.write_to_bytes().unwrap())
+                .unwrap()
+                .label
+                .as_deref(),
+            Some("Default owner")
+        );
+        album.copyright[0].type_ = Some(protobuf::EnumOrUnknown::from_i32(99));
+        assert!(
+            parse(&id(1), &album.write_to_bytes().unwrap())
+                .unwrap()
+                .label
+                .is_none()
+        );
+        for bytes in [
+            vec![],
+            b"invalid protobuf".to_vec(),
+            album_metadata(2, "Wrong identity", &[]),
+        ] {
+            assert!(matches!(
+                parse(&id(1), &bytes),
+                Err(Outcome::UnexpectedShape)
+            ));
         }
     }
 
     #[tokio::test]
-    async fn request_budget_resumes_and_cache_survives_restart_without_crossing_accounts() {
-        let (client, directory, worker) =
-            fixture((0..26).map(|_| (200, found(), Duration::ZERO)).collect()).await;
+    async fn albums_and_tracks_share_the_budget_cache_and_restart_answers() {
+        let (client, directory, worker) = metadata_client(vec![
+            (200, reply(0..20), Duration::ZERO),
+            (200, reply(20..25), Duration::ZERO),
+            (200, reply([0]), Duration::ZERO),
+        ])
+        .await;
         let mut items: Vec<_> = (0..25).map(album).collect();
-        items.push(album(0));
-        let mut existing = album(100);
-        existing["label"] = json!("Original label");
-        items.push(existing.clone());
-        let page = json!({"items":items,"total":27});
+        items.push(json!({"kind":"track","ref":format!("track:{}",id(90)),"album_ref":format!("album:{}",id(0))}));
+        let original = json!({"kind":"album","ref":format!("album:{}",id(99)),"label":"Original"});
+        items.push(original.clone());
+        let page = json!({"items":items});
         let mut first = page.clone();
         client.library_labels(&mut first).await;
-        assert_eq!(first["items"][0]["label"], "Example Records");
-        assert_eq!(first["items"][0]["label_source"], "copyright");
-        assert!(first["items"][20].get("label").is_none());
         assert_eq!(first["items"][25]["label"], "Example Records");
-        assert_eq!(first["items"][26], existing);
-        assert_eq!(diagnostic(&client).await["asked"], 20);
-        assert_eq!(diagnostic(&client).await["with_data"], 20);
-        let mut second = page.clone();
-        client.library_labels(&mut second).await;
-        assert_eq!(diagnostic(&client).await["asked"], 5);
-        assert_eq!(diagnostic(&client).await["cached"], 20);
+        assert_eq!(first["items"][0]["label_source"], "metadata");
+        assert!(first["items"][20].get("label").is_none());
+        assert_eq!(first["items"][26], original);
+        assert_eq!(diagnostic(&client, "album_label").await["asked"], 20);
+        client.library_labels(&mut first).await;
+        assert_eq!(diagnostic(&client, "album_label").await["asked"], 5);
+        assert_eq!(diagnostic(&client, "album_label").await["cached"], 20);
         let mut restarted = Client::new(
             directory.path().join("data"),
             directory.path().join("cache"),
         )
         .unwrap();
         *restarted.account.lock().await = client.account.lock().await.clone();
-        restarted.partner_fixture = client.partner_fixture.clone();
+        restarted.metadata_fixture = client.metadata_fixture.clone();
         let mut cached = page;
         restarted.library_labels(&mut cached).await;
-        assert_eq!(cached, second);
+        assert_eq!(cached, first);
         assert_eq!(
-            diagnostic(&restarted).await["outcome"]["class"],
+            diagnostic(&restarted, "album_label").await["outcome"]["class"],
             "cache_hit"
         );
-        assert_eq!(diagnostic(&restarted).await["cached"], 25);
-        restarted.account.lock().await.user = "second-account".into();
+        restarted.account.lock().await.user = "other".into();
         restarted
             .library_labels(&mut json!({"items":[album(0)]}))
             .await;
-        assert_eq!(diagnostic(&restarted).await["asked"], 1);
-        let queries = worker.join().unwrap();
-        assert_eq!(queries.len(), 26);
-        for (index, value) in queries[..25].iter().enumerate() {
-            assert_eq!(
-                value["variables"]["uri"],
-                format!("spotify:album:{}", id(index))
-            );
-        }
+        let requests = worker.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests[1].entity_request[0].entity_uri,
+            format!("spotify:album:{}", id(20))
+        );
     }
 
     #[tokio::test]
-    async fn empty_answers_are_cached_and_expire_separately_from_found_labels() {
+    async fn old_empty_answers_are_replaced_and_new_answers_expire() {
         assert_eq!(REQUEST_LIMIT, 20);
         assert_eq!(TIME_LIMIT, Duration::from_secs(6));
-        for (label, ttl) in [
-            (Some("Example Records".into()), FOUND_TTL),
-            (None, EMPTY_TTL),
-        ] {
-            let entry = Label { at: 100, label };
+        assert_eq!(FOUND_TTL, 7_776_000);
+        assert_eq!(EMPTY_TTL, 604_800);
+        for (label, ttl) in [(Some("Label".into()), FOUND_TTL), (None, EMPTY_TTL)] {
+            let entry = Label {
+                at: 100,
+                label,
+                source: LabelSource::Metadata,
+            };
             assert!(entry.fresh(100 + ttl - 1));
             assert!(!entry.fresh(100 + ttl));
             assert!(!entry.fresh(99));
         }
-        let (client, _directory, worker) = fixture(vec![
-            (200, reply(json!([])).to_string(), Duration::ZERO),
-            (200, found(), Duration::ZERO),
-            (200, found(), Duration::ZERO),
+        let empty = metadata_reply(
+            ExtensionKind::ALBUM_V4,
+            vec![(1, 200, album_metadata(1, "", &[]))],
+        );
+        let fallback = metadata_reply(
+            ExtensionKind::ALBUM_V4,
+            vec![(1, 200, album_metadata(1, "", &[("(P) 2026 Owner", true)]))],
+        );
+        let (client, _directory, worker) = metadata_client(vec![
+            (200, empty, Duration::ZERO),
+            (200, fallback, Duration::ZERO),
+            (200, reply([1]), Duration::ZERO),
         ])
         .await;
+        let identity = client.identity().await.unwrap();
+        client
+            .snapshots
+            .put(
+                &identity,
+                "album-label:v1",
+                json!({"albums":{id(1):{"at":now(),"label":null}}}),
+            )
+            .unwrap();
         let mut page = json!({"items":[album(1)]});
         client.library_labels(&mut page).await;
-        assert!(page["items"][0].get("label").is_none());
-        assert_eq!(diagnostic(&client).await["with_data"], 0);
+        assert_eq!(diagnostic(&client, "album_label").await["asked"], 1);
         client.library_labels(&mut page).await;
-        assert_eq!(diagnostic(&client).await["outcome"]["class"], "cache_hit");
-        save(&client, vec![(1, now() - EMPTY_TTL, None)]).await;
-        client.library_labels(&mut page).await;
-        assert_eq!(page["items"][0]["label"], "Example Records");
-        save(
-            &client,
-            vec![(1, now() - FOUND_TTL, Some("Expired copyright"))],
-        )
-        .await;
-        client.library_labels(&mut page).await;
-        assert_eq!(page["items"][0]["label"], "Example Records");
-        assert_eq!(diagnostic(&client).await["asked"], 1);
+        assert_eq!(
+            diagnostic(&client, "album_label").await["outcome"]["class"],
+            "cache_hit"
+        );
+        for ttl in [EMPTY_TTL, FOUND_TTL] {
+            let mut cache = client.snapshots.peek(&identity, CACHE_KEY).unwrap();
+            cache["albums"][id(1)]["at"] = json!(now() - ttl);
+            client.snapshots.put(&identity, CACHE_KEY, cache).unwrap();
+            client.library_labels(&mut page).await;
+            assert_eq!(
+                page["items"][0]["label"],
+                if ttl == EMPTY_TTL {
+                    "Owner"
+                } else {
+                    "Example Records"
+                }
+            );
+        }
         assert_eq!(worker.join().unwrap().len(), 3);
     }
 
     #[tokio::test]
-    async fn failed_responses_are_diagnosed_and_never_cached_as_empty_answers() {
-        let replies = [
-            (503, "{}".into()),
-            (401, "{}".into()),
-            (403, "{}".into()),
-            (200, "invalid json".into()),
-            (200, "{}".into()),
-            (
-                200,
-                json!({"errors":[{"extensions":{"code":"FORBIDDEN"},"message":"private-name"}]})
-                    .to_string(),
-            ),
-            (200, found()),
-        ];
-        let (client, _directory, worker) = fixture(
-            replies
-                .into_iter()
-                .map(|(status, body)| (status, body, Duration::ZERO))
-                .collect(),
-        )
-        .await;
-        let mut page = json!({"items":(0..7).map(album).collect::<Vec<_>>(),"total":7});
-        client.library_labels(&mut page).await;
-        assert!(page.get("partial").is_none());
-        assert_eq!(page["items"][6]["label"], "Example Records");
-        assert!(
-            page["items"].as_array().unwrap()[..6]
-                .iter()
-                .all(|item| item.get("label").is_none())
-        );
-        assert_eq!(
-            client
-                .label_cache(&client.identity().await.unwrap())
-                .albums
-                .len(),
-            1
-        );
-        let saved = diagnostic(&client).await;
-        assert_eq!(saved["asked"], 7);
-        assert_eq!(saved["with_data"], 1);
-        assert_eq!(saved["outcome"], json!({"class":"http","status":503}));
-        assert!(!saved.to_string().contains("private-name"));
-        assert_eq!(worker.join().unwrap().len(), 7);
-    }
-
-    #[tokio::test]
-    async fn missing_hash_disables_requests_but_cached_labels_still_apply() {
-        let (client, _directory, worker) = fixture(vec![(
-            200,
-            json!({"errors":[{"message":"PersistedQueryNotFound"}]}).to_string(),
-            Duration::ZERO,
-        )])
-        .await;
-        save(&client, vec![(2, now(), Some("Cached copyright"))]).await;
-        let original = json!({"items":(0..3).map(album).collect::<Vec<_>>()});
-        let mut page = original.clone();
-        client.library_labels(&mut page).await;
-        assert!(client.labels_disabled.load(Ordering::Relaxed));
-        assert_eq!(page["items"][2]["label"], "Cached copyright");
-        assert_eq!(diagnostic(&client).await["asked"], 1);
-        assert_eq!(
-            diagnostic(&client).await["outcome"]["code"],
-            "PersistedQueryNotFound"
-        );
-        client.library_labels(&mut original.clone()).await;
-        assert_eq!(diagnostic(&client).await["outcome"]["class"], "disabled");
-        assert_eq!(diagnostic(&client).await["asked"], 0);
-        assert_eq!(diagnostic(&client).await["cached"], 1);
+    async fn library_tracks_are_enriched_from_their_album() {
+        let (client, _directory, worker) =
+            metadata_client(vec![(200, reply([2]), Duration::ZERO)]).await;
+        let identity = client.identity().await.unwrap();
+        client.snapshots.put(&identity, "library:tracks:0:50:fields-v2", json!({"items":[{"ref":format!("track:{}",id(1)),"album_ref":format!("album:{}",id(2)),"genres":["ambient"]}]})).unwrap();
+        // Keep this integration fixture focused on the album request.
+        client
+            .snapshots
+            .put(
+                &identity,
+                "track-credits:v2",
+                json!({"tracks":{id(1):{"at":now(),"composers":[]}},"albums":{}}),
+            )
+            .unwrap();
+        let page = client.library(&json!({"kind":"tracks"})).await.unwrap();
+        assert_eq!(page["items"][0]["label"], "Example Records");
         assert_eq!(worker.join().unwrap().len(), 1);
     }
 
     #[tokio::test]
-    async fn deadline_keeps_earlier_answers_and_records_timeout() {
-        let (client, _directory, worker) = fixture(vec![
-            (200, found(), Duration::ZERO),
-            (200, found(), Duration::from_millis(400)),
-        ])
-        .await;
-        let mut page = json!({"items":(0..3).map(album).collect::<Vec<_>>()});
-        let started = Instant::now();
-        client
-            .labels_until(
-                &mut page,
-                started + Duration::from_millis(200),
-                &client.labels_disabled,
-            )
-            .await;
-        assert!(started.elapsed() < Duration::from_secs(1));
-        assert_eq!(page["items"][0]["label"], "Example Records");
-        assert!(page["items"][1].get("label").is_none());
-        assert_eq!(diagnostic(&client).await["asked"], 2);
-        assert_eq!(
-            diagnostic(&client).await["outcome"],
-            json!({"class":"timeout","stage":"request"})
-        );
-        assert_eq!(worker.join().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn no_session_gate_timeout_and_throttle_preserve_cached_labels() {
+    async fn no_session_gate_and_request_deadlines_keep_fresh_cached_labels() {
         let (client, _directory, worker) = crate::fixtures::client(vec![]).await;
-        save(&client, vec![(0, now(), Some("Cached copyright"))]).await;
-        let page = json!({"items":[album(0),album(1)]});
-        let mut missing_session = page.clone();
-        client.library_labels(&mut missing_session).await;
-        assert_eq!(missing_session["items"][0]["label"], "Cached copyright");
-        assert_eq!(diagnostic(&client).await["outcome"]["class"], "no_session");
-        assert_eq!(diagnostic(&client).await["asked"], 0);
-        let guard = client.labels_gate.lock().await;
-        let mut gate = page;
+        let identity = client.identity().await.unwrap();
         client
-            .labels_until(
-                &mut gate,
-                Instant::now() + Duration::from_millis(10),
-                &client.labels_disabled,
+            .snapshots
+            .put(
+                &identity,
+                CACHE_KEY,
+                json!({"albums":{id(0):{"at":now(),"label":"Cached","source":"metadata"}}}),
             )
-            .await;
-        assert_eq!(gate["items"][0]["label"], "Cached copyright");
+            .unwrap();
+        let mut page = json!({"items":[album(0),album(1)]});
+        client.library_labels(&mut page).await;
+        assert_eq!(page["items"][0]["label"], "Cached");
         assert_eq!(
-            diagnostic(&client).await["outcome"],
+            diagnostic(&client, "album_label").await["outcome"]["class"],
+            "no_session"
+        );
+        let _guard = client.labels_gate.lock().await;
+        client
+            .labels_until(&mut page, Instant::now() + Duration::from_millis(10))
+            .await;
+        assert_eq!(
+            diagnostic(&client, "album_label").await["outcome"],
             json!({"class":"timeout","stage":"gate"})
         );
-        drop(guard);
         assert!(worker.join().unwrap().is_empty());
-        let (client, _directory, worker) = fixture(vec![]).await;
+        let (client, _directory, worker) =
+            metadata_client(vec![(200, reply([1]), Duration::from_millis(200))]).await;
+        let mut page = json!({"items":[album(1)]});
+        let started = Instant::now();
         client
-            .partner_limits
-            .lock()
-            .await
-            .record("/album-label", 60, false);
-        client
-            .library_labels(&mut json!({"items":[album(0)]}))
+            .labels_until(&mut page, started + Duration::from_millis(50))
             .await;
+        assert!(started.elapsed() < Duration::from_millis(180));
         assert_eq!(
-            diagnostic(&client).await["outcome"],
-            json!({"class":"http","status":429})
+            diagnostic(&client, "album_label").await["outcome"],
+            json!({"class":"timeout","stage":"request"})
         );
-        assert_eq!(diagnostic(&client).await["asked"], 0);
-        assert!(worker.join().unwrap().is_empty());
+        assert!(page["items"][0].get("label").is_none());
+        assert_eq!(worker.join().unwrap().len(), 1);
     }
 }

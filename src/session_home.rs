@@ -15,10 +15,6 @@ const DJ: &str = "spotify:playlist:37i9dQZF1EYkqdzj48dyYq";
 
 impl Client {
     pub(crate) async fn partner_tokens(&self) -> Result<(String, String)> {
-        #[cfg(test)]
-        if self.partner_fixture.is_some() {
-            return Ok(("fixture-access".into(), "fixture-client".into()));
-        }
         let session = self.session().await?;
         let token = session
             .login5()
@@ -35,8 +31,6 @@ impl Client {
 
     pub(crate) fn partner_request(&self, tokens: &(String, String)) -> reqwest::RequestBuilder {
         let endpoint = "https://api-partner.spotify.com/pathfinder/v2/query";
-        #[cfg(test)]
-        let endpoint = self.partner_fixture.as_deref().unwrap_or(endpoint);
         self.http
             .post(endpoint)
             .bearer_auth(&tokens.0)

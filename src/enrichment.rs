@@ -1,13 +1,19 @@
-use crate::{snapshot::Store, state::now};
+use crate::{auth::Client, snapshot::Store, state::now};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub(crate) const KEY: &str = "library-enrichment:v1";
-const FEATURES: [&str; 3] = ["artist_genres", "album_label", "track_credits"];
+const FEATURES: [&str; 4] = [
+    "artist_genres",
+    "artist_genres_single",
+    "album_label",
+    "track_credits",
+];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+// Retain the previous diagnostic schema when merging entries.
 pub(crate) enum GraphqlCode {
     #[serde(rename = "PersistedQueryNotFound")]
     PersistedQueryNotFound,
@@ -38,14 +44,24 @@ pub(crate) enum Outcome {
     Ok,
     CacheHit,
     NoCandidates,
+    NotAttempted,
     NoSession,
     NoToken,
-    Disabled,
+    Disabled {
+        #[serde(default)]
+        remaining: u64,
+    },
     UnexpectedShape,
     Transport,
-    Http { status: u16 },
-    Graphql { code: GraphqlCode },
-    Timeout { stage: TimeoutStage },
+    Http {
+        status: u16,
+    },
+    Graphql {
+        code: GraphqlCode,
+    },
+    Timeout {
+        stage: TimeoutStage,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -78,78 +94,62 @@ impl Attempt {
     }
 }
 
-fn code(value: &str) -> GraphqlCode {
-    match value {
-        "PersistedQueryNotFound" | "PERSISTED_QUERY_NOT_FOUND" => {
-            GraphqlCode::PersistedQueryNotFound
-        }
-        "PersistedQueryNotSupported" | "PERSISTED_QUERY_NOT_SUPPORTED" => {
-            GraphqlCode::PersistedQueryNotSupported
-        }
-        "UNAUTHENTICATED" => GraphqlCode::Unauthenticated,
-        "UNAUTHORIZED" => GraphqlCode::Unauthorized,
-        "FORBIDDEN" => GraphqlCode::Forbidden,
-        "NOT_FOUND" => GraphqlCode::NotFound,
-        "BAD_USER_INPUT" => GraphqlCode::BadUserInput,
-        "INTERNAL_SERVER_ERROR" => GraphqlCode::InternalServerError,
-        "RATE_LIMITED" | "TOO_MANY_REQUESTS" => GraphqlCode::RateLimited,
-        _ => GraphqlCode::Unknown,
-    }
+#[derive(Clone, Copy, Deserialize, Serialize)]
+pub(crate) struct Pause {
+    until: u64,
+    status: u16,
 }
 
-pub(crate) fn graphql_error(value: &Value) -> Option<Outcome> {
-    let errors = value.get("errors").filter(|errors| !errors.is_null())?;
-    let Some(errors) = errors.as_array() else {
-        return Some(Outcome::Graphql {
-            code: GraphqlCode::Unknown,
-        });
-    };
-    if errors.is_empty() {
-        return None;
-    }
-    let mut found = GraphqlCode::Unknown;
-    for error in errors {
-        let mut current = error
-            .pointer("/extensions/code")
-            .and_then(Value::as_str)
-            .map(code)
-            .unwrap_or(GraphqlCode::Unknown);
-        // Some persisted-query failures have only this fixed message.
-        if current == GraphqlCode::Unknown {
-            current = match error["message"].as_str() {
-                Some("PersistedQueryNotFound") => GraphqlCode::PersistedQueryNotFound,
-                Some("PersistedQueryNotSupported") => GraphqlCode::PersistedQueryNotSupported,
-                _ => GraphqlCode::Unknown,
-            };
+impl Client {
+    pub(crate) fn enrichment_pause(&self, identity: &str, route: &str) -> Option<Outcome> {
+        let key = format!("capability:enrichment:{route}");
+        let saved = self
+            .snapshots
+            .peek(identity, &key)
+            .and_then(|v| serde_json::from_value::<Pause>(v).ok());
+        let mut pauses = self.enrichment_pauses.lock().unwrap();
+        let entry = pauses
+            .entry((identity.into(), route.into()))
+            .or_insert(Pause {
+                until: 0,
+                status: 403,
+            });
+        if let Some(saved) = saved.filter(|saved| saved.until > entry.until) {
+            *entry = saved;
         }
-        if current == GraphqlCode::PersistedQueryNotFound {
-            return Some(Outcome::Graphql { code: current });
-        }
-        if found == GraphqlCode::Unknown {
-            found = current;
-        }
-    }
-    Some(Outcome::Graphql { code: found })
-}
-
-pub(crate) fn is_disabled_error(outcome: &Outcome) -> bool {
-    matches!(
-        outcome,
-        Outcome::Graphql {
-            code: GraphqlCode::PersistedQueryNotFound
-        }
-    )
-}
-
-pub(crate) fn stops_requests(outcome: &Outcome) -> bool {
-    matches!(
-        outcome,
-        Outcome::Http { status: 429 }
-            | Outcome::Disabled
-            | Outcome::Graphql {
-                code: GraphqlCode::RateLimited
+        let remaining = entry.until.saturating_sub(now());
+        (remaining > 0).then_some(if entry.status == 403 {
+            Outcome::Disabled { remaining }
+        } else {
+            Outcome::Http {
+                status: entry.status,
             }
-    ) || is_disabled_error(outcome)
+        })
+    }
+
+    pub(crate) fn pause_enrichment(&self, identity: &str, route: &str, outcome: Outcome) {
+        let seconds = match outcome {
+            Outcome::Http { status: 403 } => 3600,
+            Outcome::Http { status: 429 } => 60,
+            _ => return,
+        };
+        let Outcome::Http { status } = outcome else {
+            return;
+        };
+        let pause = Pause {
+            until: now() + seconds,
+            status,
+        };
+        self.enrichment_pauses
+            .lock()
+            .unwrap()
+            .insert((identity.into(), route.into()), pause);
+        let _ = self.snapshots.put(
+            identity,
+            &format!("capability:enrichment:{route}"),
+            json!(pause),
+        );
+    }
 }
 
 pub(crate) fn record(store: &Store, identity: &str, feature: &str, attempt: Attempt) -> Result<()> {
@@ -173,57 +173,6 @@ pub(crate) fn record(store: &Store, identity: &str, feature: &str, attempt: Atte
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
-
-    #[test]
-    fn graphql_codes_never_copy_messages_or_unknown_values() {
-        for errors in [
-            json!([{"message":"private-name","extensions":{"code":"private-token"}}]),
-            json!([{"message":"private-token PersistedQueryNotFound private-name"}]),
-            json!({"message":"private-name","headers":{"authorization":"private-token"}}),
-        ] {
-            let outcome = graphql_error(&json!({"errors":errors})).unwrap();
-            assert_eq!(
-                outcome,
-                Outcome::Graphql {
-                    code: GraphqlCode::Unknown
-                }
-            );
-            assert_eq!(json!(outcome), json!({"class":"graphql","code":"UNKNOWN"}));
-        }
-        for value in [json!({}), json!({"errors":null}), json!({"errors":[]})] {
-            assert_eq!(graphql_error(&value), None);
-        }
-        for error in [
-            json!({"message":"PersistedQueryNotFound"}),
-            json!({"extensions":{"code":"PersistedQueryNotFound"},"message":"private-name"}),
-            json!({"extensions":{"code":"PERSISTED_QUERY_NOT_FOUND"}}),
-        ] {
-            let outcome = graphql_error(&json!({"errors":[error]})).unwrap();
-            assert!(is_disabled_error(&outcome));
-            assert!(stops_requests(&outcome));
-            assert_eq!(
-                json!(outcome),
-                json!({"class":"graphql","code":"PersistedQueryNotFound"})
-            );
-        }
-        let outcome = graphql_error(&json!({"errors":[
-            {"message":"private-token","extensions":{"code":"FORBIDDEN"}}
-        ]}))
-        .unwrap();
-        assert_eq!(
-            outcome,
-            Outcome::Graphql {
-                code: GraphqlCode::Forbidden
-            }
-        );
-        assert!(!stops_requests(&outcome));
-        assert!(stops_requests(&Outcome::Http { status: 429 }));
-        assert!(stops_requests(&Outcome::Disabled));
-        assert!(stops_requests(&Outcome::Graphql {
-            code: GraphqlCode::RateLimited
-        }));
-        assert!(!stops_requests(&Outcome::Http { status: 403 }));
-    }
 
     #[test]
     fn attempts_preserve_counts_and_the_first_failure() {

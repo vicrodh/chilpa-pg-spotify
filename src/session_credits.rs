@@ -1,21 +1,20 @@
 use crate::{
     auth::Client,
-    enrichment::{
-        self, Attempt, Outcome, TimeoutStage, graphql_error, is_disabled_error, stops_requests,
-    },
+    enrichment::{self, Attempt, Outcome, TimeoutStage},
     state::{now, reference, text},
 };
+use librespot_core::SpotifyId;
+use librespot_protocol::{extension_kind::ExtensionKind, metadata};
+use protobuf::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
-    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 use tokio::time::{Instant, timeout_at};
 
-const HASH: &str = "f135fb9be58a72d041ab5d214d817021a272405d883860468e2627afb01a3ca9";
-const CACHE_KEY: &str = "track-credits:v1";
+const CACHE_KEY: &str = "track-credits:v2";
 const ALBUM_KEY: &str = "album-credit-tracks:v1";
 const FOUND_TTL: u64 = 90 * 24 * 60 * 60;
 const EMPTY_TTL: u64 = 7 * 24 * 60 * 60;
@@ -131,69 +130,32 @@ fn raw_ids(value: &Value) -> Vec<String> {
         .collect()
 }
 
-fn query(id: &str) -> Value {
-    json!({
-        "variables":{"trackUri":format!("spotify:track:{id}"),"contributorsLimit":100,"contributorsOffset":0},
-        "operationName":"queryTrackCreditsGroupedModal",
-        "extensions":{"persistedQuery":{"version":1,"sha256Hash":HASH}}
-    })
-}
-
-#[derive(Debug, PartialEq)]
-enum Reply {
-    Credits(Vec<String>),
-    Failed(Outcome),
-}
-
-fn parse(value: &Value, disabled: &AtomicBool) -> Reply {
-    if let Some(outcome) = graphql_error(value) {
-        if is_disabled_error(&outcome) {
-            disabled.store(true, Ordering::Relaxed);
-        }
-        return Reply::Failed(outcome);
+fn parse(id: &str, bytes: &[u8]) -> Result<Vec<String>, Outcome> {
+    let track = metadata::Track::parse_from_bytes(bytes).map_err(|_| Outcome::UnexpectedShape)?;
+    if SpotifyId::from_raw(track.gid())
+        .map(|gid| gid.to_base62())
+        .ok()
+        .as_deref()
+        != Some(id)
+    {
+        return Err(Outcome::UnexpectedShape);
     }
-    let Some(items) = value
-        .pointer("/data/trackUnion/creditsTrait/contributors/items")
-        .and_then(Value::as_array)
-    else {
-        return Reply::Failed(Outcome::UnexpectedShape);
-    };
     let mut names = Vec::new();
-    for item in items {
-        let Some(name) = item["name"].as_str() else {
-            return Reply::Failed(Outcome::UnexpectedShape);
-        };
-        // The player permits a missing role or role group.
-        let role = match &item["role"] {
-            Value::Null => "",
-            Value::String(role) => role,
-            _ => return Reply::Failed(Outcome::UnexpectedShape),
-        };
-        let group = match &item["roleGroup"] {
-            Value::Null => "",
-            Value::Object(group) => match group.get("name") {
-                None | Some(Value::Null) => "",
-                Some(Value::String(name)) => name,
-                _ => return Reply::Failed(Outcome::UnexpectedShape),
-            },
-            _ => return Reply::Failed(Outcome::UnexpectedShape),
-        };
-        if name.trim().is_empty() {
-            return Reply::Failed(Outcome::UnexpectedShape);
-        }
-        let role = role.to_ascii_lowercase();
-        let group = group.to_ascii_lowercase();
-        if (role.contains("compos")
-            || role.contains("songwrit")
-            || role == "writer"
-            || group == "writers"
-            || group == "written by")
-            && !names.iter().any(|n| n == name)
+    for artist in track.artist_with_role {
+        if artist.role.and_then(|role| role.enum_value().ok())
+            != Some(metadata::artist_with_role::ArtistRole::ARTIST_ROLE_COMPOSER)
         {
+            continue;
+        }
+        let name = artist.artist_name().trim();
+        if name.is_empty() {
+            return Err(Outcome::UnexpectedShape);
+        }
+        if !names.iter().any(|known| known == name) {
             names.push(name.to_owned());
         }
     }
-    Reply::Credits(names)
+    Ok(names)
 }
 
 impl Client {
@@ -218,22 +180,11 @@ impl Client {
     }
 
     pub(crate) async fn library_composers(&self, kind: &str, value: &mut Value) {
-        self.composers_until(
-            kind,
-            value,
-            Instant::now() + TIME_LIMIT,
-            &self.credits_disabled,
-        )
-        .await;
+        self.composers_until(kind, value, Instant::now() + TIME_LIMIT)
+            .await;
     }
 
-    async fn composers_until(
-        &self,
-        kind: &str,
-        value: &mut Value,
-        deadline: Instant,
-        disabled: &AtomicBool,
-    ) {
+    async fn composers_until(&self, kind: &str, value: &mut Value, deadline: Instant) {
         let Ok(Ok(identity)) = timeout_at(deadline, self.identity()).await else {
             return;
         };
@@ -329,67 +280,46 @@ impl Client {
             missing.rotate_left(start);
         }
         if !missing.is_empty() {
-            if disabled.load(Ordering::Relaxed) {
-                attempt.fail(Outcome::Disabled);
-            } else {
-                match self.enrichment_tokens(deadline).await {
-                    Ok(tokens) => {
-                        for id in missing.iter().take(REQUEST_LIMIT) {
-                            let remaining = timeout_at(deadline, async {
-                                self.partner_limits.lock().await.remaining("/credits")
-                            })
-                            .await;
-                            match remaining {
-                                Ok(0) => {}
-                                Ok(_) => {
-                                    attempt.fail(Outcome::Http { status: 429 });
-                                    break;
-                                }
-                                Err(_) => {
-                                    attempt.fail(Outcome::Timeout {
-                                        stage: TimeoutStage::Request,
-                                    });
-                                    break;
-                                }
+            let selected: Vec<_> = missing.iter().take(REQUEST_LIMIT).collect();
+            let uris: Vec<_> = selected
+                .iter()
+                .map(|id| format!("spotify:track:{id}"))
+                .collect();
+            match self
+                .enrichment_metadata(
+                    &identity,
+                    ExtensionKind::TRACK_V4,
+                    &uris,
+                    deadline,
+                    &mut attempt,
+                )
+                .await
+            {
+                Ok(mut rows) => {
+                    for (id, uri) in selected.iter().zip(&uris) {
+                        match rows
+                            .remove(uri)
+                            .unwrap_or(Err(Outcome::UnexpectedShape))
+                            .and_then(|bytes| parse(id, &bytes))
+                        {
+                            Ok(composers) => {
+                                attempt.with_data += usize::from(!composers.is_empty());
+                                saved.tracks.insert(
+                                    (*id).clone(),
+                                    Credit {
+                                        at: now(),
+                                        composers,
+                                    },
+                                );
                             }
-                            if Instant::now() >= deadline {
-                                attempt.fail(Outcome::Timeout {
-                                    stage: TimeoutStage::Request,
-                                });
-                                break;
-                            }
-                            saved.after = Some(id.clone());
-                            attempt.asked += 1;
-                            match timeout_at(deadline, self.track_credit(id, &tokens, disabled))
-                                .await
-                            {
-                                Ok(Reply::Credits(composers)) => {
-                                    attempt.with_data += usize::from(!composers.is_empty());
-                                    saved.tracks.insert(
-                                        id.clone(),
-                                        Credit {
-                                            at: now(),
-                                            composers,
-                                        },
-                                    );
-                                }
-                                Ok(Reply::Failed(outcome)) => {
-                                    attempt.fail(outcome);
-                                    if stops_requests(&outcome) {
-                                        break;
-                                    }
-                                }
-                                Err(_) => {
-                                    attempt.fail(Outcome::Timeout {
-                                        stage: TimeoutStage::Request,
-                                    });
-                                    break;
-                                }
-                            }
+                            Err(outcome) => attempt.fail(outcome),
                         }
                     }
-                    Err(outcome) => attempt.fail(outcome),
                 }
+                Err(outcome) => attempt.fail(outcome),
+            }
+            if attempt.asked > 0 {
+                saved.after = selected.last().map(|id| (*id).clone());
             }
         }
         saved.apply(kind, value);
@@ -398,804 +328,328 @@ impl Client {
         }
         let _ = enrichment::record(&self.snapshots, &identity, "track_credits", attempt);
     }
-
-    async fn track_credit(
-        &self,
-        id: &str,
-        tokens: &(String, String),
-        disabled: &AtomicBool,
-    ) -> Reply {
-        match self.enrichment_query(&query(id), tokens, "/credits").await {
-            Ok(value) => parse(&value, disabled),
-            Err(outcome) => {
-                if is_disabled_error(&outcome) {
-                    disabled.store(true, Ordering::Relaxed);
-                }
-                Reply::Failed(outcome)
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread::JoinHandle;
-    use tiny_http::{Header, Method, Response, Server, StatusCode};
-
-    fn credits(items: Value) -> Value {
-        json!({"data":{"trackUnion":{"creditsTrait":{"contributors":{"items":items}}}}})
-    }
-
-    fn writer(name: &str) -> Value {
-        json!({"name":name,"role":"Composer","roleGroup":{"name":"Writers"}})
-    }
-
-    fn reply(name: &str) -> String {
-        credits(json!([writer(name)])).to_string()
-    }
-
-    fn id(index: usize) -> String {
-        format!("{index:022}")
-    }
+    use crate::fixtures::{
+        enrichment_diagnostic as diagnostic, id, metadata_client, metadata_reply, track_metadata,
+    };
 
     fn track(index: usize) -> Value {
-        json!({
-            "kind":"track","ref":format!("track:{}", id(index)),
-            "title":format!("Song {index}"),"album_ref":format!("album:{}", id(100)),
-            "duration_ms":180000,"year":2000,"genres":["ambient"],"label":"Example Records",
-            "added_at":1704164645_i64,"release_type":"album","quality":{"codec":"vorbis"},
-            "composer":"Work header","composer_ref":"work-header","work":"Suite"
-        })
+        json!({"kind":"track","ref":format!("track:{}",id(index)),"album_ref":format!("album:{}",id(100)),"label":"Existing","composer":"Work header","composer_ref":"work-header","work":"Suite"})
     }
 
-    async fn seed_page(client: &Client, kind: &str, items: Vec<Value>) {
-        client
-            .snapshots
-            .put(
-                &client.identity().await.unwrap(),
-                &format!("library:{kind}:0:50:fields-v2"),
-                json!({"total":items.len(),"items":items}),
-            )
-            .unwrap();
+    fn reply(indices: impl IntoIterator<Item = usize>) -> Vec<u8> {
+        metadata_reply(
+            ExtensionKind::TRACK_V4,
+            indices
+                .into_iter()
+                .map(|i| (i, 200, track_metadata(i, &[&format!("Composer {i}")])))
+                .collect(),
+        )
     }
 
-    async fn save_cache(client: &Client, entries: Vec<(usize, u64, Vec<&str>)>) {
-        let mut saved = Cache::default();
-        for (index, at, composers) in entries {
-            saved.tracks.insert(
-                id(index),
+    async fn seed(client: &Client, entries: Vec<(usize, u64, Vec<&str>)>) {
+        let mut cache = Cache::default();
+        for (i, at, names) in entries {
+            cache.tracks.insert(
+                id(i),
                 Credit {
                     at,
-                    composers: composers.into_iter().map(str::to_owned).collect(),
+                    composers: names.into_iter().map(str::to_owned).collect(),
                 },
             );
         }
         client
             .snapshots
-            .put(
-                &client.identity().await.unwrap(),
-                CACHE_KEY,
-                serde_json::to_value(saved).unwrap(),
-            )
+            .put(&client.identity().await.unwrap(), CACHE_KEY, json!(cache))
             .unwrap();
     }
 
-    async fn fixture(
-        replies: Vec<(u16, String, Duration)>,
-    ) -> (Client, tempfile::TempDir, JoinHandle<Vec<Value>>) {
-        let (mut client, directory, worker) = crate::fixtures::client(vec![]).await;
-        assert!(worker.join().unwrap().is_empty());
-        let server = Server::http("127.0.0.1:0").unwrap();
-        client.partner_fixture = Some(format!(
-            "http://{}/pathfinder/v2/query",
-            server.server_addr()
-        ));
-        let worker = std::thread::spawn(move || {
-            let mut queries = Vec::new();
-            for (status, body, delay) in replies {
-                let mut request = server
-                    .recv_timeout(Duration::from_secs(10))
-                    .unwrap()
-                    .expect("expected credit request");
-                assert_eq!(request.method(), &Method::Post);
-                assert_eq!(request.url(), "/pathfinder/v2/query");
-                for (name, expected) in [
-                    ("Authorization", "Bearer fixture-access"),
-                    ("client-token", "fixture-client"),
-                ] {
-                    assert!(
-                        request
-                            .headers()
-                            .iter()
-                            .any(|h| { h.field.equiv(name) && h.value.as_str() == expected })
-                    );
-                }
-                let body_value: Value = serde_json::from_reader(request.as_reader()).unwrap();
-                assert_eq!(body_value["operationName"], "queryTrackCreditsGroupedModal");
-                assert_eq!(
-                    body_value["extensions"]["persistedQuery"],
-                    json!({"version":1,"sha256Hash":HASH})
-                );
-                assert_eq!(body_value["variables"]["contributorsLimit"], 100);
-                assert_eq!(body_value["variables"]["contributorsOffset"], 0);
-                assert_eq!(body_value["variables"].as_object().unwrap().len(), 3);
-                queries.push(body_value);
-                std::thread::sleep(delay);
-                let _ = request.respond(
-                    Response::from_string(body)
-                        .with_status_code(StatusCode(status))
-                        .with_header(Header::from_bytes("Retry-After", "60").unwrap()),
-                );
-            }
-            assert!(
-                server
-                    .recv_timeout(Duration::from_millis(100))
-                    .unwrap()
-                    .is_none(),
-                "unexpected extra credit request"
-            );
-            queries
-        });
-        (client, directory, worker)
-    }
-
-    fn immediate(status: u16, body: String) -> (u16, String, Duration) {
-        (status, body, Duration::ZERO)
-    }
-
     #[test]
-    fn roles_keep_writers_in_order_and_drop_duplicates() {
-        let contributors = [
-            ("Performer", "Vocals", "Performers"),
-            ("First", "cOmPoSeR", "Other"),
-            ("Second", "SongWriting", "Other"),
-            ("Third", "WRITER", "Other"),
-            ("Fourth", "Lyricist", "WrItErS"),
-            ("Fifth", "Lyricist", "Written BY"),
-            ("First", "Composition", "Writers"),
-            ("Producer", "Producer", "Production"),
-            ("Copyist", "Copywriter", "Other"),
-        ].map(|(name, role, group)| json!({"name":name,"role":role,"roleGroup":{"name":group},"uri":"optional"}));
-        let disabled = AtomicBool::new(false);
-        assert_eq!(
-            parse(&credits(json!(contributors)), &disabled),
-            Reply::Credits(
-                ["First", "Second", "Third", "Fourth", "Fifth"]
-                    .map(str::to_owned)
-                    .to_vec()
-            )
-        );
-        assert_eq!(
-            parse(&credits(json!([])), &disabled),
-            Reply::Credits(vec![])
-        );
-        assert_eq!(
-            parse(
-                &credits(
-                    json!([{"name":"Singer","role":"Vocals","roleGroup":{"name":"Performers"}}])
-                ),
-                &disabled
-            ),
-            Reply::Credits(vec![])
-        );
-        for value in [
-            json!({}),
-            json!({"data":null}),
-            credits(json!({})),
-            credits(json!([null])),
-            credits(json!([{"name":"Writer","role":{"name":"Composer"}}])),
-            credits(json!([{"name":"Writer","roleGroup":[]}])),
-            credits(json!([{"name":"Writer","roleGroup":{"name":42}}])),
-            credits(json!([{"name":" ","role":"Composer","roleGroup":{"name":"Writers"}}])),
+    fn only_explicit_composer_roles_are_used_in_response_order() {
+        use librespot_protocol::metadata::{ArtistWithRole, artist_with_role::ArtistRole};
+        let bytes = track_metadata(1, &[" First ", "Second", "First"]);
+        let mut track = metadata::Track::parse_from_bytes(&bytes).unwrap();
+        for role in [
+            Some(ArtistRole::ARTIST_ROLE_MAIN_ARTIST),
+            Some(ArtistRole::ARTIST_ROLE_CONDUCTOR),
+            None,
         ] {
-            assert_eq!(
-                parse(&value, &disabled),
-                Reply::Failed(Outcome::UnexpectedShape)
-            );
+            let mut artist = ArtistWithRole::new();
+            artist.set_artist_name("Not a composer".into());
+            if let Some(role) = role {
+                artist.set_role(role);
+            }
+            track.artist_with_role.push(artist);
         }
-        assert!(!disabled.load(Ordering::Relaxed));
         assert_eq!(
-            parse(
-                &credits(json!([
-                    {"name":"Writer","role":"Composer","roleGroup":null},
-                    {"name":"Lyricist","role":null,"roleGroup":{"name":"Writers"}},
-                    {"name":"Singer","role":null,"roleGroup":null}
-                ])),
-                &disabled
-            ),
-            Reply::Credits(vec!["Writer".into(), "Lyricist".into()])
+            parse(&id(1), &track.write_to_bytes().unwrap()),
+            Ok(vec!["First".into(), "Second".into()])
         );
-    }
-
-    #[tokio::test]
-    async fn album_only_listings_fetch_known_tracks_with_the_same_budget() {
-        let (client, _directory, worker) = fixture(
-            (0..25)
-                .map(|i| immediate(200, reply(&format!("Writer {i}"))))
-                .collect(),
-        )
-        .await;
-        client.remember_album_tracks(&[json!({"album":{
-            "id":id(100),"tracks":{"items":(0..25).map(|i| json!({"id":id(i)})).collect::<Vec<_>>()}
-        }})]).await;
-        seed_page(
-            &client,
-            "albums",
-            vec![
-                json!({"ref":format!("album:{}",id(100)),"label":"Existing"}),
-                json!({"ref":format!("album:{}",id(100)),"label":"Existing"}),
-            ],
-        )
-        .await;
-        let identity = client.identity().await.unwrap();
-        let params = json!({"kind":"albums"});
-        let first = client.library(&params).await.unwrap();
-        assert_eq!(first["items"][0]["composers"].as_array().unwrap().len(), 20);
-        let diagnostic = client.snapshots.peek(&identity, enrichment::KEY).unwrap();
-        assert_eq!(diagnostic["track_credits"]["asked"], 20);
-        assert_eq!(diagnostic["track_credits"]["with_data"], 20);
-        assert_eq!(diagnostic["track_credits"]["outcome"]["class"], "ok");
-        let second = client.library(&params).await.unwrap();
-        assert_eq!(
-            second["items"][0]["composers"].as_array().unwrap().len(),
-            25
-        );
-        assert_eq!(second["items"][0], second["items"][1]);
-        assert_eq!(client.library(&params).await.unwrap(), second);
-        let diagnostic = client.snapshots.peek(&identity, enrichment::KEY).unwrap();
-        assert_eq!(diagnostic["track_credits"]["asked"], 0);
-        assert_eq!(diagnostic["track_credits"]["cached"], 25);
-        assert_eq!(diagnostic["track_credits"]["outcome"]["class"], "cache_hit");
-        assert_eq!(worker.join().unwrap().len(), 25);
-    }
-
-    #[tokio::test]
-    async fn credit_diagnostics_distinguish_http_graphql_shape_and_empty_answers() {
-        for (status, body, outcome) in [
-            (
-                403,
-                "private body".into(),
-                json!({"class":"http","status":403}),
-            ),
-            (429, "{}".into(), json!({"class":"http","status":429})),
-            (200, "{}".into(), json!({"class":"unexpected_shape"})),
-            (
-                200,
-                json!({"errors":[{"extensions":{"code":"FORBIDDEN"},"message":"private"}]})
-                    .to_string(),
-                json!({"class":"graphql","code":"FORBIDDEN"}),
-            ),
-            (200, credits(json!([])).to_string(), json!({"class":"ok"})),
+        assert_eq!(parse(&id(1), &track_metadata(1, &[])), Ok(vec![]));
+        for bytes in [
+            vec![],
+            b"invalid protobuf".to_vec(),
+            track_metadata(2, &["Wrong identity"]),
+            track_metadata(1, &[" "]),
         ] {
-            let (client, _directory, worker) = fixture(vec![immediate(status, body)]).await;
-            let mut value = json!({"items":[track(1)]});
-            client.library_composers("tracks", &mut value).await;
-            let diagnostic = client
-                .snapshots
-                .peek(&client.identity().await.unwrap(), enrichment::KEY)
-                .unwrap();
-            assert_eq!(diagnostic["track_credits"]["outcome"], outcome);
-            assert_eq!(diagnostic["track_credits"]["asked"], 1);
-            assert_eq!(diagnostic["track_credits"]["with_data"], 0);
-            assert_eq!(value["items"][0], track(1));
-            assert!(!diagnostic.to_string().contains("private"));
-            assert_eq!(worker.join().unwrap().len(), 1);
+            assert_eq!(parse(&id(1), &bytes), Err(Outcome::UnexpectedShape));
         }
     }
 
     #[tokio::test]
-    async fn credit_gate_timeout_and_missing_session_are_recorded_without_requests() {
-        let (client, _directory, worker) = crate::fixtures::client(vec![]).await;
-        let identity = client.identity().await.unwrap();
-        let mut value = json!({"items":[track(1)]});
-        client.library_composers("tracks", &mut value).await;
-        assert_eq!(
-            client.snapshots.peek(&identity, enrichment::KEY).unwrap()["track_credits"]["outcome"]
-                ["class"],
-            "no_session"
-        );
-        save_cache(&client, vec![(1, now(), vec!["Cached"])]).await;
-        let _guard = client.credits_gate.lock().await;
-        client
-            .composers_until(
-                "tracks",
-                &mut value,
-                Instant::now() + Duration::from_millis(20),
-                &client.credits_disabled,
-            )
-            .await;
-        let diagnostic = client.snapshots.peek(&identity, enrichment::KEY).unwrap();
-        assert_eq!(
-            diagnostic["track_credits"]["outcome"],
-            json!({"class":"timeout","stage":"gate"})
-        );
-        assert_eq!(diagnostic["track_credits"]["asked"], 0);
-        assert_eq!(diagnostic["track_credits"]["cached"], 1);
-        assert_eq!(value["items"][0]["composers"], json!(["Cached"]));
-        assert!(worker.join().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn request_budget_resumes_cached_pages_and_survives_restart() {
-        let (client, directory, worker) = fixture(
-            (0..25)
-                .map(|i| immediate(200, reply(&format!("Writer {i}"))))
-                .collect(),
-        )
+    async fn budget_resumes_on_cached_pages_and_survives_restart() {
+        let (client, directory, worker) = metadata_client(vec![
+            (200, reply(0..20), Duration::ZERO),
+            (200, reply(20..25), Duration::ZERO),
+        ])
         .await;
         let mut items: Vec<_> = (0..25).map(track).collect();
         items.push(track(0));
         items.push(track(99));
-        seed_page(&client, "tracks", items.clone()).await;
-        save_cache(&client, vec![(99, now(), vec!["Cached writer"])]).await;
+        seed(&client, vec![(99, now(), vec!["Cached"])]).await;
+        let identity = client.identity().await.unwrap();
+        client
+            .snapshots
+            .put(
+                &identity,
+                "library:tracks:0:50:fields-v2",
+                json!({"items":items,"total":27}),
+            )
+            .unwrap();
         let params = json!({"kind":"tracks"});
         let first = client.library(&params).await.unwrap();
-        assert_eq!(first["total"], 27);
-        assert_eq!(
-            first["items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|v| v.get("composers").is_some())
-                .count(),
-            22
-        );
         assert!(first["items"][20].get("composers").is_none());
-        assert_eq!(first["items"][26]["composers"], json!(["Cached writer"]));
+        assert_eq!(first["items"][25]["composers"], json!(["Composer 0"]));
+        assert_eq!(first["items"][26]["composers"], json!(["Cached"]));
+        assert_eq!(diagnostic(&client, "track_credits").await["asked"], 20);
         for (original, enriched) in items.iter().zip(first["items"].as_array().unwrap()) {
             let mut unchanged = enriched.clone();
             unchanged.as_object_mut().unwrap().remove("composers");
-            assert_eq!(&unchanged, original);
+            assert_eq!(*original, unchanged);
         }
         let second = client.library(&params).await.unwrap();
-        assert!(
-            second["items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|v| v["composers"].is_array())
-        );
+        assert_eq!(diagnostic(&client, "track_credits").await["asked"], 5);
+        assert_eq!(diagnostic(&client, "track_credits").await["cached"], 21);
         let mut restarted = Client::new(
             directory.path().join("data"),
             directory.path().join("cache"),
         )
         .unwrap();
         *restarted.account.lock().await = client.account.lock().await.clone();
-        restarted.api_base = client.api_base.clone();
-        restarted.partner_fixture = client.partner_fixture.clone();
+        restarted.metadata_fixture = client.metadata_fixture.clone();
         assert_eq!(restarted.library(&params).await.unwrap(), second);
-        let queries = worker.join().unwrap();
-        assert_eq!(queries.len(), 25);
-        for (i, query) in queries.iter().enumerate() {
-            assert_eq!(
-                query["variables"]["trackUri"],
-                format!("spotify:track:{}", id(i))
-            );
-        }
+        assert_eq!(
+            diagnostic(&restarted, "track_credits").await["outcome"]["class"],
+            "cache_hit"
+        );
+        let requests = worker.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].entity_request[0].entity_uri,
+            format!("spotify:track:{}", id(20))
+        );
     }
 
-    #[test]
-    fn ttl_distinguishes_found_empty_expired_and_future_answers() {
+    #[tokio::test]
+    async fn album_only_listings_fetch_known_tracks_and_union_composers() {
+        let first = metadata_reply(
+            ExtensionKind::TRACK_V4,
+            vec![
+                (1, 200, track_metadata(1, &["First", "Shared"])),
+                (2, 200, track_metadata(2, &["Shared", "Last"])),
+            ],
+        );
+        let (client, _directory, worker) =
+            metadata_client(vec![(200, first, Duration::ZERO)]).await;
+        client
+            .remember_album_tracks(&[
+                json!({"album":{"id":id(100),"tracks":{"items":[{"id":id(1)},{"id":id(2)}]}}}),
+            ])
+            .await;
+        let mut page = json!({"items":[{"ref":format!("album:{}",id(100)),"label":"Existing"},{"ref":format!("album:{}",id(101))}]});
+        client.library_composers("albums", &mut page).await;
+        assert_eq!(
+            page["items"][0]["composers"],
+            json!(["First", "Shared", "Last"])
+        );
+        assert!(page["items"][1].get("composers").is_none());
+        client.library_composers("albums", &mut page).await;
+        assert_eq!(
+            diagnostic(&client, "track_credits").await["outcome"]["class"],
+            "cache_hit"
+        );
+        assert_eq!(worker.join().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn empty_answers_expire_and_remain_account_scoped() {
         assert_eq!(REQUEST_LIMIT, 20);
         assert_eq!(TIME_LIMIT, Duration::from_secs(6));
-        assert_eq!(FOUND_TTL, 7_776_000);
-        assert_eq!(EMPTY_TTL, 604_800);
-        for (composers, ttl) in [(vec!["Writer".into()], FOUND_TTL), (vec![], EMPTY_TTL)] {
+        for (composers, ttl) in [(vec!["Name".into()], FOUND_TTL), (vec![], EMPTY_TTL)] {
             let credit = Credit { at: 100, composers };
             assert!(credit.fresh(100 + ttl - 1));
             assert!(!credit.fresh(100 + ttl));
             assert!(!credit.fresh(99));
         }
-    }
-
-    #[tokio::test]
-    async fn empty_answers_are_cached_expire_and_stay_account_scoped() {
-        let (client, _directory, worker) = fixture(vec![
-            immediate(200, credits(json!([])).to_string()),
-            immediate(200, reply("After expiry")),
-            immediate(200, reply("Other account")),
+        let empty = metadata_reply(
+            ExtensionKind::TRACK_V4,
+            vec![(1, 200, track_metadata(1, &[]))],
+        );
+        let (client, _directory, worker) = metadata_client(vec![
+            (200, empty, Duration::ZERO),
+            (200, reply([1]), Duration::ZERO),
+            (200, reply([1]), Duration::ZERO),
         ])
         .await;
-        seed_page(&client, "tracks", vec![track(1)]).await;
-        let params = json!({"kind":"tracks"});
-        let first = client.library(&params).await.unwrap();
-        assert!(first["items"][0].get("composers").is_none());
-        assert_eq!(client.library(&params).await.unwrap(), first);
         let identity = client.identity().await.unwrap();
-        let cached = client.snapshots.peek(&identity, CACHE_KEY).unwrap();
-        assert_eq!(cached["tracks"][id(1)]["composers"], json!([]));
-        save_cache(&client, vec![(1, now() - EMPTY_TTL, vec![])]).await;
+        client
+            .snapshots
+            .put(
+                &identity,
+                "track-credits:v1",
+                json!({"tracks":{id(1):{"at":now(),"composers":[]}},"albums":{}}),
+            )
+            .unwrap();
+        let mut page = json!({"items":[track(1)]});
+        client.library_composers("tracks", &mut page).await;
+        assert_eq!(diagnostic(&client, "track_credits").await["asked"], 1);
+        client.library_composers("tracks", &mut page).await;
         assert_eq!(
-            client.library(&params).await.unwrap()["items"][0]["composers"],
-            json!(["After expiry"])
+            diagnostic(&client, "track_credits").await["outcome"]["class"],
+            "cache_hit"
         );
+        seed(&client, vec![(1, now() - EMPTY_TTL, vec![])]).await;
+        client.library_composers("tracks", &mut page).await;
+        assert_eq!(page["items"][0]["composers"], json!(["Composer 1"]));
         client.account.lock().await.user = "other".into();
-        seed_page(&client, "tracks", vec![track(1)]).await;
-        assert_eq!(
-            client.library(&params).await.unwrap()["items"][0]["composers"],
-            json!(["Other account"])
-        );
-        assert_eq!(
-            client.snapshots.peek(&identity, CACHE_KEY).unwrap()["tracks"][id(1)]["composers"],
-            json!(["After expiry"])
-        );
+        client.library_composers("tracks", &mut page).await;
+        assert_eq!(diagnostic(&client, "track_credits").await["asked"], 1);
         assert_eq!(worker.join().unwrap().len(), 3);
     }
 
     #[tokio::test]
-    async fn failures_do_not_fail_or_mark_the_listing_partial_and_retry_later() {
-        let mut replies = vec![
-            immediate(503, "{}".into()),
-            immediate(401, "{}".into()),
-            immediate(403, "{}".into()),
-            immediate(200, "invalid json".into()),
-            immediate(200, "{}".into()),
-            immediate(200, json!({"errors":[{"message":"Denied"}]}).to_string()),
-            immediate(200, reply("Last writer")),
-        ];
-        replies.extend((0..6).map(|_| immediate(200, reply("Recovered"))));
-        let (client, _directory, worker) = fixture(replies).await;
-        seed_page(&client, "tracks", (0..7).map(track).collect()).await;
-        let params = json!({"kind":"tracks"});
-        let first = client.library(&params).await.unwrap();
-        assert_eq!(first["total"], 7);
-        assert!(first.get("partial").is_none());
-        assert!(first.get("cached").is_none());
-        assert!(
-            first["items"].as_array().unwrap()[..6]
-                .iter()
-                .all(|v| v.get("composers").is_none())
+    async fn failed_rows_are_not_empty_answers_and_later_rows_are_preserved() {
+        let rows = metadata_reply(
+            ExtensionKind::TRACK_V4,
+            vec![
+                (0, 503, vec![]),
+                (1, 200, vec![]),
+                (2, 404, vec![]),
+                (3, 200, track_metadata(3, &["Found"])),
+            ],
         );
-        assert_eq!(first["items"][6]["composers"], json!(["Last writer"]));
-        let cached = client
+        let (client, _directory, worker) = metadata_client(vec![
+            (200, rows, Duration::ZERO),
+            (200, reply(0..3), Duration::ZERO),
+        ])
+        .await;
+        let mut page = json!({"items":(0..4).map(track).collect::<Vec<_>>()});
+        client.library_composers("tracks", &mut page).await;
+        assert_eq!(page["items"][3]["composers"], json!(["Found"]));
+        assert!(page["items"][0].get("composers").is_none());
+        assert!(page.get("partial").is_none());
+        let cache = client
             .snapshots
             .peek(&client.identity().await.unwrap(), CACHE_KEY)
             .unwrap();
-        assert_eq!(cached["tracks"].as_object().unwrap().len(), 1);
-        let second = client.library(&params).await.unwrap();
-        assert!(
-            second["items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|v| v["composers"].is_array())
-        );
-        assert_eq!(worker.join().unwrap().len(), 13);
+        assert_eq!(cache["tracks"].as_object().unwrap().len(), 1);
+        client.library_composers("tracks", &mut page).await;
+        assert_eq!(diagnostic(&client, "track_credits").await["asked"], 3);
+        assert_eq!(worker.join().unwrap().len(), 2);
     }
 
     #[tokio::test]
-    async fn repeated_failures_do_not_starve_tracks_after_the_request_budget() {
-        let mut replies: Vec<_> = (0..20).map(|_| immediate(503, "{}".into())).collect();
-        replies.extend((0..20).map(|_| immediate(200, reply("Recovered"))));
-        let (client, _directory, worker) = fixture(replies).await;
-        seed_page(&client, "tracks", (0..25).map(track).collect()).await;
-        let params = json!({"kind":"tracks"});
-        let first = client.library(&params).await.unwrap();
-        assert!(
-            first["items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|v| v.get("composers").is_none())
-        );
-        let second = client.library(&params).await.unwrap();
-        assert!(
-            second["items"].as_array().unwrap()[20..]
-                .iter()
-                .all(|v| v["composers"].is_array())
-        );
-        let queries = worker.join().unwrap();
-        assert_eq!(queries.len(), 40);
+    async fn failed_batches_rotate_the_budget_and_concurrent_calls_coalesce() {
+        let selected = (20..25).chain(0..15);
+        let (client, _directory, worker) = metadata_client(vec![
+            (503, vec![], Duration::ZERO),
+            (200, reply(selected), Duration::from_millis(30)),
+        ])
+        .await;
+        let page = json!({"items":(0..25).map(track).collect::<Vec<_>>()});
+        client.library_composers("tracks", &mut page.clone()).await;
+        let mut second = page.clone();
+        client.library_composers("tracks", &mut second).await;
+        assert!(second["items"][24]["composers"].is_array());
+        let requests = worker.join().unwrap();
         assert_eq!(
-            queries[20]["variables"]["trackUri"],
+            requests[1].entity_request[0].entity_uri,
             format!("spotify:track:{}", id(20))
         );
-        assert_eq!(
-            queries[25]["variables"]["trackUri"],
-            format!("spotify:track:{}", id(0))
-        );
-    }
-
-    #[tokio::test]
-    async fn concurrent_listings_share_successful_credit_requests() {
         let (client, _directory, worker) =
-            fixture(vec![(200, reply("Writer"), Duration::from_millis(100))]).await;
-        seed_page(&client, "tracks", vec![track(1)]).await;
-        let params = json!({"kind":"tracks"});
-        let (first, second) = tokio::join!(client.library(&params), client.library(&params));
-        assert_eq!(first.unwrap(), second.unwrap());
-        assert_eq!(worker.join().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn rate_limit_stops_requests_but_keeps_cached_and_completed_credits() {
-        let (client, _directory, worker) = fixture(vec![
-            immediate(200, reply("First")),
-            immediate(429, "{}".into()),
-        ])
-        .await;
-        seed_page(&client, "tracks", (0..4).map(track).collect()).await;
-        save_cache(&client, vec![(3, now(), vec!["Cached"])]).await;
-        let params = json!({"kind":"tracks"});
-        let first = client.library(&params).await.unwrap();
-        assert_eq!(first["items"][0]["composers"], json!(["First"]));
-        assert!(first["items"][1].get("composers").is_none());
-        assert!(first["items"][2].get("composers").is_none());
-        assert_eq!(first["items"][3]["composers"], json!(["Cached"]));
-        assert_eq!(client.library(&params).await.unwrap(), first);
-        assert_eq!(worker.join().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn graphql_rate_limit_stops_and_preserves_the_pause() {
-        let (client, _directory, worker) = fixture(vec![immediate(
-            200,
-            json!({"errors":[{"extensions":{"code":"RATE_LIMITED"}}]}).to_string(),
-        )])
-        .await;
-        let mut value = json!({"items":[track(1), track(2)]});
-        client.library_composers("tracks", &mut value).await;
-        let identity = client.identity().await.unwrap();
-        let diagnostic = client.snapshots.peek(&identity, enrichment::KEY).unwrap();
-        assert_eq!(
-            diagnostic["track_credits"]["outcome"],
-            json!({"class":"graphql","code":"RATE_LIMITED"})
+            metadata_client(vec![(200, reply([1]), Duration::from_millis(30))]).await;
+        let mut first = json!({"items":[track(1)]});
+        let mut second = first.clone();
+        tokio::join!(
+            client.library_composers("tracks", &mut first),
+            client.library_composers("tracks", &mut second)
         );
-        assert_eq!(diagnostic["track_credits"]["asked"], 1);
-        client.library_composers("tracks", &mut value).await;
-        let diagnostic = client.snapshots.peek(&identity, enrichment::KEY).unwrap();
-        assert_eq!(
-            diagnostic["track_credits"]["outcome"],
-            json!({"class":"http","status":429})
-        );
-        assert_eq!(diagnostic["track_credits"]["asked"], 0);
+        assert_eq!(first, second);
         assert_eq!(worker.join().unwrap().len(), 1);
     }
 
     #[tokio::test]
-    async fn one_wall_deadline_cancels_slow_requests_and_keeps_earlier_answers() {
-        let (client, _directory, worker) = fixture(vec![
-            (200, reply("First"), Duration::from_millis(300)),
-            (200, reply("Too late"), Duration::from_secs(6)),
-        ])
-        .await;
-        seed_page(&client, "tracks", (0..4).map(track).collect()).await;
-        save_cache(&client, vec![(3, now(), vec!["Cached"])]).await;
-        let started = Instant::now();
-        let value = client.library(&json!({"kind":"tracks"})).await.unwrap();
-        let elapsed = started.elapsed();
-        assert!(elapsed >= TIME_LIMIT);
-        assert!(
-            elapsed < TIME_LIMIT + Duration::from_millis(250),
-            "{elapsed:?}"
-        );
-        assert_eq!(value["items"][0]["composers"], json!(["First"]));
-        assert!(value["items"][1].get("composers").is_none());
-        assert!(value["items"][2].get("composers").is_none());
-        assert_eq!(value["items"][3]["composers"], json!(["Cached"]));
-        let saved = client
-            .snapshots
-            .peek(&client.identity().await.unwrap(), CACHE_KEY)
-            .unwrap();
-        assert_eq!(saved["tracks"][id(0)]["composers"], json!(["First"]));
-        assert!(saved["tracks"].get(id(1)).is_none());
-        assert_eq!(worker.join().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn missing_hash_disables_later_calls_and_clients_but_not_cache_hits() {
-        let (client, directory, worker) = fixture(vec![immediate(
-            200,
-            json!({"errors":[{"message":"PersistedQueryNotFound"}]}).to_string(),
-        )])
-        .await;
-        save_cache(&client, vec![(3, now(), vec!["Cached"])]).await;
-        let disabled = AtomicBool::new(false);
-        let mut value = json!({"items":[track(0),track(1),track(3)]});
-        client
-            .composers_until("tracks", &mut value, Instant::now() + TIME_LIMIT, &disabled)
-            .await;
-        assert!(disabled.load(Ordering::Relaxed));
-        let mut replacement = Client::new(
-            directory.path().join("data"),
-            directory.path().join("cache"),
-        )
-        .unwrap();
-        *replacement.account.lock().await = client.account.lock().await.clone();
-        replacement.partner_fixture = client.partner_fixture.clone();
-        replacement
-            .composers_until("tracks", &mut value, Instant::now() + TIME_LIMIT, &disabled)
-            .await;
-        assert!(value["items"][0].get("composers").is_none());
-        assert!(value["items"][1].get("composers").is_none());
-        assert_eq!(value["items"][2]["composers"], json!(["Cached"]));
+    async fn cache_write_failures_keep_fetched_composers() {
+        let (client, directory, worker) =
+            metadata_client(vec![(200, reply([1]), Duration::ZERO)]).await;
+        let path = directory.path().join("cache/snapshots");
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, "blocked writes").unwrap();
+        let mut page = json!({"items":[track(1)]});
+        client.library_composers("tracks", &mut page).await;
+        assert_eq!(page["items"][0]["composers"], json!(["Composer 1"]));
         assert_eq!(worker.join().unwrap().len(), 1);
     }
 
     #[tokio::test]
-    async fn missing_hash_in_a_graphql_http_error_also_disables_requests() {
-        let (client, _directory, worker) = fixture(vec![immediate(
-            400,
-            json!({"errors":[{
-                "message":"Unknown operation","extensions":{"code":"PersistedQueryNotFound"}
-            }]})
-            .to_string(),
-        )])
-        .await;
-        let disabled = AtomicBool::new(false);
-        let mut value = json!({"items":[track(0),track(1)]});
-        client
-            .composers_until("tracks", &mut value, Instant::now() + TIME_LIMIT, &disabled)
-            .await;
-        assert!(disabled.load(Ordering::Relaxed));
-        assert!(
-            value["items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|v| v.get("composers").is_none())
-        );
-        assert_eq!(worker.join().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn cache_write_failure_keeps_successful_credits_in_the_listing() {
-        let (client, directory, worker) = fixture(vec![immediate(200, reply("Writer"))]).await;
-        let snapshots = directory.path().join("cache/snapshots");
-        std::fs::remove_dir(&snapshots).unwrap();
-        std::fs::write(&snapshots, "unwritable cache directory").unwrap();
-        let mut value = json!({"items":[track(1)]});
-        client.library_composers("tracks", &mut value).await;
-        assert_eq!(value["items"][0]["composers"], json!(["Writer"]));
-        assert_eq!(worker.join().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn missing_session_and_expired_credits_leave_fields_unchanged() {
+    async fn missing_session_and_deadlines_keep_only_fresh_credits() {
         let (client, _directory, worker) = crate::fixtures::client(vec![]).await;
-        seed_page(&client, "tracks", vec![track(1), track(2)]).await;
-        save_cache(
+        seed(
             &client,
             vec![
-                (1, now() - FOUND_TTL, vec!["Expired"]),
-                (2, now(), vec!["Fresh"]),
+                (0, now() - FOUND_TTL, vec!["Expired"]),
+                (1, now(), vec!["Fresh"]),
             ],
         )
         .await;
-        let value = client.library(&json!({"kind":"tracks"})).await.unwrap();
-        assert_eq!(value["items"][0], track(1));
-        assert_eq!(value["items"][1]["composers"], json!(["Fresh"]));
-        assert_eq!(value["items"][1]["composer"], "Work header");
-        assert_eq!(value["items"][1]["composer_ref"], "work-header");
-        assert_eq!(value["items"][1]["work"], "Suite");
+        let mut page = json!({"items":[track(0),track(1)]});
+        client.library_composers("tracks", &mut page).await;
+        assert_eq!(page["items"][0], track(0));
+        assert_eq!(page["items"][1]["composers"], json!(["Fresh"]));
+        assert_eq!(
+            diagnostic(&client, "track_credits").await["outcome"]["class"],
+            "no_session"
+        );
+        let _guard = client.credits_gate.lock().await;
+        client
+            .composers_until(
+                "tracks",
+                &mut page,
+                Instant::now() + Duration::from_millis(10),
+            )
+            .await;
+        assert_eq!(
+            diagnostic(&client, "track_credits").await["outcome"],
+            json!({"class":"timeout","stage":"gate"})
+        );
+        assert_eq!(page["items"][1]["composers"], json!(["Fresh"]));
         assert!(worker.join().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn albums_union_known_tracks_without_requests_including_after_restart() {
-        let (client, directory, worker) = fixture(vec![
-            immediate(
-                200,
-                credits(json!([writer("First"), writer("Shared")])).to_string(),
-            ),
-            immediate(
-                200,
-                credits(json!([writer("Shared"), writer("Last")])).to_string(),
-            ),
-        ])
-        .await;
-        seed_page(&client, "tracks", vec![track(1), track(2)]).await;
-        client.library(&json!({"kind":"tracks"})).await.unwrap();
-        seed_page(
-            &client,
-            "albums",
-            vec![
-                json!({"kind":"album","ref":format!("album:{}", id(100)),"label":"Existing"}),
-                json!({"kind":"album","ref":format!("album:{}", id(101)),"label":"Existing"}),
-            ],
-        )
-        .await;
-        let value = client.library(&json!({"kind":"albums"})).await.unwrap();
-        assert_eq!(
-            value["items"][0]["composers"],
-            json!(["First", "Shared", "Last"])
-        );
-        assert!(value["items"][1].get("composers").is_none());
-        let mut restarted = Client::new(
-            directory.path().join("data"),
-            directory.path().join("cache"),
-        )
-        .unwrap();
-        *restarted.account.lock().await = client.account.lock().await.clone();
-        restarted.partner_fixture = client.partner_fixture.clone();
-        assert_eq!(
-            restarted.library(&json!({"kind":"albums"})).await.unwrap(),
-            value
-        );
-        assert_eq!(worker.join().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn albums_use_embedded_and_previously_cached_record_tracks() {
-        let (client, _directory, worker) = fixture(vec![immediate(200, reply("New"))]).await;
-        save_cache(
-            &client,
-            vec![
-                (1, now(), vec!["First", "Shared"]),
-                (2, now(), vec!["Shared", "Last"]),
-                (3, now() - FOUND_TTL, vec!["Expired"]),
-            ],
-        )
-        .await;
-        let identity = client.identity().await.unwrap();
-        let album = |index| {
-            json!({"album":{
-                "id":id(index),"label":"Existing","tracks":{"items":[{"id":id(2)},{"id":id(1)},{"id":id(3)}]}
-            }})
-        };
-        let query = [("limit", "50"), ("offset", "0")];
+        let (client, _directory, worker) =
+            metadata_client(vec![(200, reply([0]), Duration::from_millis(200))]).await;
+        seed(&client, vec![(1, now(), vec!["Fresh"])]).await;
+        let started = Instant::now();
         client
-            .snapshots
-            .put(
-                &identity,
-                &format!(
-                    "web:Primary:0:/me/albums:{}",
-                    serde_json::to_string(&query).unwrap()
-                ),
-                json!({"items":[album(100)],"total":1,"next":null}),
-            )
-            .unwrap();
-        // Old cards are rebuilt from the cached service response to retain membership.
-        client
-            .snapshots
-            .put(
-                &identity,
-                "library:albums:0:50:fields-v1",
-                json!({"items":[{"kind":"album","ref":format!("album:{}", id(100))}],"total":1}),
-            )
-            .unwrap();
-        let value = client.library(&json!({"kind":"albums"})).await.unwrap();
+            .composers_until("tracks", &mut page, started + Duration::from_millis(50))
+            .await;
+        assert!(started.elapsed() < Duration::from_millis(180));
+        assert_eq!(page["items"][1]["composers"], json!(["Fresh"]));
         assert_eq!(
-            value["items"][0]["composers"],
-            json!(["Shared", "Last", "First", "New"])
-        );
-        client
-            .snapshots
-            .put(
-                &identity,
-                &format!("session:v2:album:{}:0", id(101)),
-                json!({"tracks":[track(1),track(2)]}),
-            )
-            .unwrap();
-        client
-            .snapshots
-            .put(
-                &identity,
-                &format!("web:Primary:0:/albums/{}:[]", id(102)),
-                album(102)["album"].clone(),
-            )
-            .unwrap();
-        seed_page(
-            &client,
-            "albums",
-            (101..103)
-                .map(|index| {
-                    json!({
-                        "kind":"album","ref":format!("album:{}", id(index)),"label":"Existing"
-                    })
-                })
-                .collect(),
-        )
-        .await;
-        let value = client.library(&json!({"kind":"albums"})).await.unwrap();
-        assert_eq!(
-            value["items"][0]["composers"],
-            json!(["First", "Shared", "Last"])
-        );
-        assert_eq!(
-            value["items"][1]["composers"],
-            json!(["Shared", "Last", "First", "New"])
+            diagnostic(&client, "track_credits").await["outcome"],
+            json!({"class":"timeout","stage":"request"})
         );
         assert_eq!(worker.join().unwrap().len(), 1);
     }

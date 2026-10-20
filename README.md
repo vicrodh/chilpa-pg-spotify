@@ -95,22 +95,31 @@ outbound firewall for librespot's regional access points and audio CDNs.
 
 ## Limits
 
-- Library enrichment is optional. Album copyright lines and track composers each
-  use at most 20 requests and six seconds per listing, including session setup.
-  Found answers are cached for 90 days, empty answers for seven days. Albums use
-  known track membership to collect composers; unknown tracks are not fetched.
-  Copyright text fills a missing label verbatim and has `label_source: "copyright"`;
-  it is not a normalized record-label name.
+- Library enrichment is optional. Labels use session `ALBUM_V4` metadata for
+  albums and tracks' albums. The protobuf label takes precedence; otherwise the
+  first phonographic copyright's owner is used. `label_source` is `metadata` or
+  `copyright`. Existing labels are preserved.
+- Composer credits use session `TRACK_V4` metadata and only its explicit composer
+  roles. This is not a complete list of all writers or lyricists. Albums use known
+  track membership to collect composers; unknown tracks are not fetched.
+  Each enrichment batches at most 20 entities within six seconds, including
+  session setup. Found answers last 90 days, empty answers seven days. The v2
+  label and credit caches discard previous empty answers. Neither uses Pathfinder.
 - Artist genres use the Web API when supplied. A denied or missing batch endpoint
   falls back to at most 20 individual artists within six seconds. Missing fields
   are not treated as empty answers or inferred from other metadata.
+- A 403 pauses its enrichment route for one hour per account, including across
+  restarts. Extended metadata shares one pause for labels and credits; batch and
+  single-artist Web API requests have separate pauses. Cached answers still apply.
 - The account snapshot `library-enrichment:v1` records `artist_genres`,
-  `album_label`, and `track_credits`. Each contains Unix seconds in `at`, a fixed
-  `outcome`, `asked`, `with_data`, and `cached` counts. The first failure in a call
-  remains visible even if later requests succeed. A batch and its single-artist
-  fallback both count toward `asked`; cached answers count separately.
-  No response text, headers, tokens, item IDs, or names enter this diagnostic
-  payload. `cache_hit` and `no_candidates` describe calls without new lookups.
+  `artist_genres_single`, `album_label`, and `track_credits`. Each contains Unix
+  seconds in `at`, a fixed `outcome`, `asked`, `with_data`, and `cached` counts.
+  Counts belong to the named route; the single-artist fallback has its own outcome.
+  `asked` counts entities submitted, including failed requests, rather than HTTP
+  packets. The first failure remains visible within each call. `disabled` includes
+  `remaining` seconds; `not_attempted` means no fallback ran. `cache_hit` and
+  `no_candidates` describe calls without new lookups. No response text, headers,
+  tokens, item IDs, or names enter this diagnostic payload.
 - Vorbis playback is lossy. Lossless delivery, Spotify Connect receiver control,
   remote queue mirroring, podcasts and offline downloads are not implemented.
 - Playlist writes are limited to creation and adding up to 100 tracks per request

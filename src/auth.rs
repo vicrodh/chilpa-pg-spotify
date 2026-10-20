@@ -113,10 +113,11 @@ pub struct Client {
     pub(crate) library_reauth: AtomicBool,
     pub(crate) credits_gate: Mutex<()>,
     pub(crate) labels_gate: Mutex<()>,
-    pub(crate) credits_disabled: AtomicBool,
-    pub(crate) labels_disabled: AtomicBool,
+    pub(crate) enrichment_pauses:
+        std::sync::Mutex<std::collections::HashMap<(String, String), crate::enrichment::Pause>>,
+    pub(crate) metadata_gate: Mutex<()>,
     #[cfg(test)]
-    pub(crate) partner_fixture: Option<String>,
+    pub(crate) metadata_fixture: Option<String>,
 }
 
 impl Client {
@@ -170,10 +171,10 @@ impl Client {
             library_reauth: AtomicBool::new(false),
             credits_gate: Mutex::new(()),
             labels_gate: Mutex::new(()),
-            credits_disabled: AtomicBool::new(false),
-            labels_disabled: AtomicBool::new(false),
+            enrichment_pauses: std::sync::Mutex::new(Default::default()),
+            metadata_gate: Mutex::new(()),
             #[cfg(test)]
-            partner_fixture: None,
+            metadata_fixture: None,
         })
     }
 
