@@ -111,6 +111,9 @@ pub struct Client {
     search_notice: Mutex<Option<String>>,
     pub(crate) snapshots: crate::snapshot::Store,
     pub(crate) library_reauth: AtomicBool,
+    pub(crate) credits_gate: Mutex<()>,
+    #[cfg(test)]
+    pub(crate) partner_fixture: Option<String>,
 }
 
 impl Client {
@@ -162,10 +165,31 @@ impl Client {
             search_notice: Mutex::new(None),
             snapshots,
             library_reauth: AtomicBool::new(false),
+            credits_gate: Mutex::new(()),
+            #[cfg(test)]
+            partner_fixture: None,
         })
     }
 
-    pub async fn checked(mut response: reqwest::Response) -> Result<Value> {
+    pub(crate) async fn response_json(mut response: reqwest::Response) -> Result<Value> {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| anyhow::anyhow!("Spotify response was interrupted."))?
+        {
+            if bytes.len() + chunk.len() > 8 * 1024 * 1024 {
+                bail!("Spotify response exceeds the size limit.");
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.is_empty() {
+            return Ok(json!({}));
+        }
+        serde_json::from_slice(&bytes).context("Spotify returned an invalid response.")
+    }
+
+    pub async fn checked(response: reqwest::Response) -> Result<Value> {
         let status = response.status().as_u16();
         if status == 429 {
             let seconds = response
@@ -177,23 +201,7 @@ impl Client {
             bail!("Spotify rate limit reached. Retry after {seconds} seconds.");
         }
         match status {
-            200..=299 => {
-                let mut bytes = Vec::new();
-                while let Some(chunk) = response
-                    .chunk()
-                    .await
-                    .map_err(|_| anyhow::anyhow!("Spotify response was interrupted."))?
-                {
-                    if bytes.len() + chunk.len() > 8 * 1024 * 1024 {
-                        bail!("Spotify response exceeds the size limit.");
-                    }
-                    bytes.extend_from_slice(&chunk);
-                }
-                if bytes.is_empty() {
-                    return Ok(json!({}));
-                }
-                serde_json::from_slice(&bytes).context("Spotify returned an invalid response.")
-            }
+            200..=299 => Self::response_json(response).await,
             401 => bail!("Spotify authorization expired or was rejected. Sign in again."),
             403 => bail!(
                 "Spotify denied this operation. Check the account, app access and subscription."

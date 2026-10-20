@@ -14,6 +14,35 @@ const HASH: &str = "eb3fba2d388cf4fc4d696b1757a58584e9538a3b515ea742e9cc94658073
 const DJ: &str = "spotify:playlist:37i9dQZF1EYkqdzj48dyYq";
 
 impl Client {
+    pub(crate) async fn partner_tokens(&self) -> Result<(String, String)> {
+        #[cfg(test)]
+        if self.partner_fixture.is_some() {
+            return Ok(("fixture-access".into(), "fixture-client".into()));
+        }
+        let session = self.session().await?;
+        let token = session
+            .login5()
+            .auth_token()
+            .await
+            .map_err(|_| anyhow::anyhow!("Spotify playback could not be authorized."))?;
+        let client_token = session
+            .spclient()
+            .client_token()
+            .await
+            .map_err(|_| anyhow::anyhow!("Spotify playback could not be authorized."))?;
+        Ok((token.access_token, client_token))
+    }
+
+    pub(crate) fn partner_request(&self, tokens: &(String, String)) -> reqwest::RequestBuilder {
+        let endpoint = "https://api-partner.spotify.com/pathfinder/v2/query";
+        #[cfg(test)]
+        let endpoint = self.partner_fixture.as_deref().unwrap_or(endpoint);
+        self.http
+            .post(endpoint)
+            .bearer_auth(&tokens.0)
+            .header("client-token", &tokens.1)
+    }
+
     pub async fn session_home(&self) -> Result<Vec<Value>> {
         let identity = self.identity().await?;
         if self
@@ -37,24 +66,12 @@ impl Client {
         }
         let context = self.token().await?;
         let session = self.session().await?;
-        let token = session
-            .login5()
-            .auth_token()
-            .await
-            .map_err(|_| anyhow::anyhow!("Spotify Home could not be authorized."))?;
-        let client_token = session
-            .spclient()
-            .client_token()
-            .await
-            .map_err(|_| anyhow::anyhow!("Spotify Home could not be authorized."))?;
+        let tokens = self.partner_tokens().await?;
         let mut result = vec![];
         let mut seen = HashSet::new();
         for offset in (0..200).step_by(20) {
             let response = self
-                .http
-                .post("https://api-partner.spotify.com/pathfinder/v2/query")
-                .bearer_auth(&token.access_token)
-                .header("client-token", &client_token)
+                .partner_request(&tokens)
                 .json(&query(&session.country(), &context, offset))
                 .send()
                 .await

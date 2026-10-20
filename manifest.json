@@ -1,7 +1,7 @@
 {
   "id": "app.chilpa.spotify",
   "name": "Spotify",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "api_version": 1,
   "kind": "source",
   "runtime": "process",

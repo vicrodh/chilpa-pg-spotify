@@ -10,6 +10,7 @@ mod lyrics;
 mod native_catalog;
 mod playlist_actions;
 mod radio;
+mod session_credits;
 mod session_home;
 mod session_playlists;
 mod snapshot;

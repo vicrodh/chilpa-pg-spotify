@@ -358,6 +358,8 @@ impl Client {
         if matches!(text(params, "kind"), "albums" | "tracks") {
             // Enrich cached pages too, so later calls can fill the remaining artists.
             let _ = self.library_genres(&mut value).await;
+            self.library_composers(text(params, "kind"), &mut value)
+                .await;
         }
         self.project_playlist_permissions(&mut value, "items").await;
         Ok(value)
@@ -431,7 +433,7 @@ impl Client {
         let kind = text(params, "kind");
         let (offset, limit) = paging(params);
         let schema = if matches!(kind, "albums" | "tracks") {
-            ":fields-v1"
+            ":fields-v2"
         } else {
             ""
         };
@@ -492,6 +494,9 @@ impl Client {
             let batch = page["items"]
                 .as_array()
                 .context("Spotify returned an invalid library page.")?;
+            if kind == "albums" {
+                self.remember_album_tracks(batch).await;
+            }
             for raw in batch {
                 if position >= offset && output.len() < limit {
                     if let Some(item) = library_card(raw, kind) {
