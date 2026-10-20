@@ -1,5 +1,64 @@
 # Validation
 
+## Album barcodes 0.3.6 (phase 6)
+
+`src/catalog.rs:154` now carries `upc` from Web API `external_ids.upc` onto
+album cards, including saved albums in `library.list` and other cards using
+the same mapper. Only nonempty ASCII digit strings are emitted, unchanged,
+so leading zeros survive. Missing, empty, numeric or malformed values are
+omitted; no barcode is inferred from other identifiers.
+
+`src/native_catalog.rs:186` maps playback-session album protobuf external IDs
+of type `upc` into that same path. Type matching is case insensitive, as for
+the existing track ISRC mapping. Both `ALBUM_V4` artist releases and album
+detail cards use this conversion. Tracks gain no UPC from their own external
+IDs or their album.
+
+Inline JSON fixtures at `src/catalog.rs:979` and protobuf fixtures at
+`src/native_catalog.rs:327` cover both paths, leading zeros, absent and invalid
+values, another external ID before UPC, and unchanged track fields. The
+protobuf fixture passes through the batched `ALBUM_V4` response decoder.
+
+Manifest, Cargo package and lockfile versions are 0.3.6. Network permissions,
+dependencies, vendor files, source pins and process/API contracts are unchanged.
+Validation uses repository fixtures, loopback HTTP and temporary profiles only.
+No live service, owner account, private plugin data/cache or environment files
+are accessed. No live installation or host-load validation is performed.
+
+Checks ran with Cargo offline through the shared lock and capped wrapper,
+one command at a time. `cargo fmt --all` completed, followed by
+`python3 tools/verify-vendor` and `cargo test --locked --bin plugin`:
+
+```text
+Verified 666 vendored source files.
+Finished `test` profile [unoptimized + debuginfo] target(s) in 15.71s
+test result: ok. 108 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.02s
+```
+
+The ignored test requires explicit live-account access and was not run.
+`CARGO_NET_OFFLINE=true python3 tools/build-native` built and packaged the
+release using its own lock and capped wrapper. The exact executable extracted
+from the ZIP passed the protocol suite with fresh temporary profiles:
+
+```text
+Finished `release` profile [optimized] target(s) in 25.28s
+ZIP verification passed: 10 entries, CRC, sidecar, version, unchanged permissions, executable mode, packaged files and binary.
+Ran 10 tests in 0.308s
+OK
+```
+
+Package: `dist/app.chilpa.spotify-0.3.6-linux-x86_64.zip`.
+SHA-256:
+
+```text
+a556b4191a6c7d2fd8c413eccebd16ed1a91abd4fcd56e0376ab54cba56d78f3
+```
+
+The sidecar matches, packaged files and licenses match their repository inputs,
+and the executable matches the release build with no owner home-directory build
+path. The existing vendored lint-expectation warning and four release unused
+import/helper warnings remain.
+
 ## Library enrichment 0.3.5 (phase 5)
 
 This phase uses repository source and loopback fixtures only. The owner supplied

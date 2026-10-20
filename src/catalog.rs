@@ -151,6 +151,14 @@ pub fn card(raw: &Value, kind: &str) -> Option<Value> {
     if let Some(isrc) = raw["external_ids"]["isrc"].as_str() {
         item["isrc"] = json!(isrc);
     }
+    if kind == "album" {
+        if let Some(upc) = raw["external_ids"]["upc"]
+            .as_str()
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        {
+            item["upc"] = json!(upc);
+        }
+    }
     if kind == "track" {
         item["quality"] = json!({"codec":"vorbis"});
     }
@@ -976,7 +984,8 @@ mod tests {
                 "artists":[{"id":"abcdefghijklmnopqrstuv","name":"Artist"}],
                 "images":[{"url":"cover"}],"total_tracks":12,
                 "release_date":"1998-06-15","album_type":"compilation",
-                "genres":["Music","rock","indie rock"],"label":"Example Records"
+                "genres":["Music","rock","indie rock"],"label":"Example Records",
+                "external_ids":{"upc":"001234567890"}
             }
         });
         assert_eq!(
@@ -987,9 +996,35 @@ mod tests {
                 "image":"cover","description":"","tracks":12,
                 "year":1998,"release_date":"1998-06-15",
                 "genres":["indie rock","rock"],"genre":"indie rock, rock",
-                "label":"Example Records","release_type":"compilation","added_at":1704164645
+                "label":"Example Records","release_type":"compilation","added_at":1704164645,
+                "upc":"001234567890"
             })
         );
+        assert_eq!(card(&raw["album"], "album").unwrap()["upc"], "001234567890");
+    }
+
+    #[test]
+    fn albums_omit_missing_or_invalid_barcodes() {
+        for external_ids in [
+            Value::Null,
+            json!({}),
+            json!({"ean":"001234567890"}),
+            json!({"upc":null}),
+            json!({"upc":1234567890}),
+            json!({"upc":""}),
+            json!({"upc":" 001234567890 "}),
+            json!({"upc":"001234-567890"}),
+            json!({"upc":"００１２３４５６７８９０"}),
+        ] {
+            let album = json!({"id":"1234567890123456789012","external_ids":external_ids});
+            assert!(card(&album, "album").unwrap().get("upc").is_none());
+            assert!(
+                library_card(&json!({"album":album}), "albums")
+                    .unwrap()
+                    .get("upc")
+                    .is_none()
+            );
+        }
     }
 
     #[test]
@@ -1000,11 +1035,13 @@ mod tests {
                 "id":"1234567890123456789012","name":"Song",
                 "artists":[{"id":"abcdefghijklmnopqrstuv","name":"Artist"}],
                 "duration_ms":123000,"track_number":2,"disc_number":1,
-                "explicit":false,"is_playable":true,"external_ids":{"isrc":"TEST12345678"},
+                "explicit":false,"is_playable":true,
+                "external_ids":{"isrc":"TEST12345678","upc":"009876543210"},
                 "album":{
                     "id":"abcdefghijklmnopqrstuv","name":"Record","images":[{"url":"cover"}],
                     "release_date":"1998","album_type":"single",
-                    "genres":["chamber pop"],"label":"Example Records"
+                    "genres":["chamber pop"],"label":"Example Records",
+                    "external_ids":{"upc":"001234567890"}
                 }
             }
         });
@@ -1124,6 +1161,7 @@ mod tests {
                     "composer",
                     "composer_ref",
                     "work",
+                    "upc",
                 ] {
                     assert!(item.get(key).is_none(), "{kind}: {key}");
                 }

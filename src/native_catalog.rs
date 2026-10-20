@@ -184,6 +184,11 @@ fn artists(raw: &[metadata::Artist]) -> Vec<Value> {
         .collect()
 }
 fn album_json(album: &metadata::Album) -> Result<Value> {
+    let upc = album
+        .external_id
+        .iter()
+        .find(|id| id.type_().eq_ignore_ascii_case("upc"))
+        .map(|id| id.id());
     let images: Vec<_> = album.cover_group.image.iter().map(|i| json!({"url":format!("https://i.scdn.co/image/{}",FileId::from(i)),"width":i.width(),"height":i.height()})).collect();
     let date = album.date.get_or_default();
     let released = if date.has_year() {
@@ -192,7 +197,7 @@ fn album_json(album: &metadata::Album) -> Result<Value> {
         String::new()
     };
     Ok(
-        json!({"id":spotify_id(album.gid())?,"name":album.name(),"artists":artists(&album.artist),"images":images,
+        json!({"external_ids":{"upc":upc},"id":spotify_id(album.gid())?,"name":album.name(),"artists":artists(&album.artist),"images":images,
         "release_date":released,"total_tracks":album.disc.iter().map(|d|d.track.len()).sum::<usize>()}),
     )
 }
@@ -319,12 +324,92 @@ mod tests {
     }
 
     #[test]
+    fn native_albums_preserve_upc_from_extended_metadata() {
+        for kind in ["upc", "UPC"] {
+            let mut album = metadata::Album::new();
+            album.set_gid(
+                SpotifyId::from_base62(&crate::fixtures::id(1))
+                    .unwrap()
+                    .to_raw()
+                    .to_vec(),
+            );
+            album.external_id = vec![
+                metadata::ExternalId {
+                    type_: Some("ean".into()),
+                    id: Some("009876543210".into()),
+                    ..Default::default()
+                },
+                metadata::ExternalId {
+                    type_: Some(kind.into()),
+                    id: Some("001234567890".into()),
+                    ..Default::default()
+                },
+            ];
+            let response = crate::fixtures::metadata_reply(
+                ExtensionKind::ALBUM_V4,
+                vec![(1, 200, album.write_to_bytes().unwrap())],
+            );
+            let uri = format!("spotify:album:{}", crate::fixtures::id(1));
+            let rows = answers(
+                &[uri.clone()],
+                ExtensionKind::ALBUM_V4,
+                BatchedExtensionResponse::parse_from_bytes(&response).unwrap(),
+            )
+            .unwrap();
+            let parsed = metadata::Album::parse_from_bytes(&rows[&uri]).unwrap();
+            assert_eq!(
+                card(&album_json(&parsed).unwrap(), "album").unwrap()["upc"],
+                "001234567890"
+            );
+        }
+    }
+
+    #[test]
+    fn native_albums_omit_missing_or_invalid_barcodes() {
+        let mut album = metadata::Album::new();
+        album.set_gid(vec![2; 16]);
+        assert!(
+            card(&album_json(&album).unwrap(), "album")
+                .unwrap()
+                .get("upc")
+                .is_none()
+        );
+        for (kind, id) in [
+            ("ean", Some("001234567890")),
+            ("upc", None),
+            ("upc", Some("")),
+            ("upc", Some("001234-567890")),
+        ] {
+            album.external_id = vec![metadata::ExternalId {
+                type_: Some(kind.into()),
+                id: id.map(str::to_owned),
+                ..Default::default()
+            }];
+            let parsed =
+                metadata::Album::parse_from_bytes(&album.write_to_bytes().unwrap()).unwrap();
+            assert!(
+                card(&album_json(&parsed).unwrap(), "album")
+                    .unwrap()
+                    .get("upc")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
     fn native_tracks_preserve_recording_ids_and_artist_references() {
         let mut track = metadata::Track::new();
         track.set_gid(vec![1; 16]);
         track.set_name("Recording".into());
         let mut album = metadata::Album::new();
         album.set_gid(vec![2; 16]);
+        let upc = metadata::ExternalId {
+            type_: Some("upc".into()),
+            id: Some("001234567890".into()),
+            ..Default::default()
+        };
+        album.external_id.push(upc.clone());
+        track.external_id.push(upc);
         track.album = protobuf::MessageField::some(album);
         let mut artist = metadata::Artist::new();
         artist.set_gid(vec![3; 16]);
@@ -336,6 +421,7 @@ mod tests {
         track.external_id.push(external);
         let card = track_card(&track).unwrap();
         assert_eq!(card["isrc"], "USABC1234567");
+        assert!(card.get("upc").is_none());
         assert!(card["artist_ref"].as_str().unwrap().starts_with("artist:"));
         track.external_id.clear();
         assert!(track_card(&track).unwrap().get("isrc").is_none());

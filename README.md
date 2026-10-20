@@ -13,6 +13,7 @@ The SDK includes it as a [native source example](https://github.com/vicrodh/chil
 
 - Search tracks, albums, artists and playlists, including Spotify links and URIs.
 - Browse albums, artist releases, popular tracks, playlists and saved library items.
+- Album cards include a digit-only UPC string when supplied by the Web API or playback metadata.
 - Discover personalized Home when available, editorial playlists and new releases.
 - Radio from album and artist pages, with a stable mix until explicitly refreshed.
 - Create playlists and add ordered tracks through Chilpa's playlist picker.
