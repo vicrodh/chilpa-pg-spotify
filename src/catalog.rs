@@ -1,5 +1,6 @@
 use crate::{
-    auth::Client,
+    auth::{ApiFailure, Client},
+    enrichment::{self, Attempt, Outcome, TimeoutStage},
     state::{reference, text},
 };
 use anyhow::{Context, Result, bail};
@@ -7,9 +8,46 @@ use librespot_core::date::Date;
 use reqwest::Method;
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use tokio::time::{Duration, Instant, timeout_at};
 
 const ARTIST_GENRES_KEY: &str = "artist-genres:v1";
 const ARTIST_GENRES_TTL: u64 = 30 * 24 * 60 * 60;
+const ARTIST_GENRES_BUDGET: Duration = Duration::from_secs(6);
+
+fn artist_genres_error(error: &anyhow::Error) -> Outcome {
+    if let Some(failure) = error.downcast_ref::<ApiFailure>() {
+        Outcome::Http {
+            status: failure.status,
+        }
+    } else if error.downcast_ref::<serde_json::Error>().is_some() {
+        Outcome::UnexpectedShape
+    } else {
+        Outcome::Transport
+    }
+}
+
+fn save_artist_genres(
+    saved: &mut serde_json::Map<String, Value>,
+    artist: &Value,
+    attempt: &mut Attempt,
+) -> bool {
+    let Some(raw) = artist["genres"]
+        .as_array()
+        .filter(|raw| raw.iter().all(Value::is_string))
+    else {
+        attempt.fail(Outcome::UnexpectedShape);
+        return false;
+    };
+    let names = genres(&Value::Array(raw.clone()));
+    if !names.is_empty() {
+        attempt.with_data += 1;
+    }
+    saved.insert(
+        text(artist, "id").into(),
+        json!({"at":crate::state::now(),"genres":names}),
+    );
+    true
+}
 
 fn genres(value: &Value) -> Vec<String> {
     let mut names = Vec::new();
@@ -358,6 +396,9 @@ impl Client {
         if matches!(text(params, "kind"), "albums" | "tracks") {
             // Enrich cached pages too, so later calls can fill the remaining artists.
             let _ = self.library_genres(&mut value).await;
+            if text(params, "kind") == "albums" {
+                self.library_labels(&mut value).await;
+            }
             self.library_composers(text(params, "kind"), &mut value)
                 .await;
         }
@@ -366,6 +407,12 @@ impl Client {
     }
 
     async fn library_genres(&self, value: &mut Value) -> Result<()> {
+        self.library_genres_until(value, Instant::now() + ARTIST_GENRES_BUDGET)
+            .await
+    }
+
+    async fn library_genres_until(&self, value: &mut Value, deadline: Instant) -> Result<()> {
+        let mut attempt = Attempt::start();
         let mut seen = HashSet::new();
         let ids: Vec<_> = array(&value["items"])
             .iter()
@@ -374,54 +421,163 @@ impl Client {
             .map(|(_, id)| id)
             .filter(|id| seen.insert(id.clone()))
             .collect();
+        let identity = match timeout_at(deadline, self.identity()).await {
+            Ok(Ok(identity)) => identity,
+            _ => return Ok(()),
+        };
         if ids.is_empty() {
+            attempt.outcome = Outcome::NoCandidates;
+            let _ = enrichment::record(&self.snapshots, &identity, "artist_genres", attempt);
             return Ok(());
         }
-        let identity = self.identity().await?;
-        let saved = self
-            .snapshots
-            .read(&identity, ARTIST_GENRES_KEY, 0, false, || async {
-                let now = crate::state::now();
-                let mut saved = self
-                    .snapshots
-                    .peek(&identity, ARTIST_GENRES_KEY)
-                    .and_then(|value| value.as_object().cloned())
-                    .unwrap_or_default();
-                saved.retain(|_, entry| {
-                    entry["at"]
-                        .as_u64()
-                        .is_some_and(|at| at <= now && now - at < ARTIST_GENRES_TTL)
-                });
-                let missing: Vec<_> = ids.iter().filter(|id| !saved.contains_key(*id)).collect();
-                for batch in missing.chunks(50).take(4) {
-                    let query = [(
-                        "ids",
-                        batch.iter().map(|id| id.as_str()).collect::<Vec<_>>().join(","),
-                    )];
-                    let Ok(response) = self.api(Method::GET, "/artists", &query).await else {
-                        break;
-                    };
-                    let Some(artists) = response["artists"].as_array() else {
-                        break;
-                    };
-                    for artist in artists {
-                        let id = text(artist, "id");
-                        if batch.iter().any(|requested| requested.as_str() == id) {
-                            saved.insert(
-                                id.into(),
-                                json!({"at":crate::state::now(),"genres":genres(&artist["genres"])}),
-                            );
+        let mut stage = TimeoutStage::Gate;
+        let mut collected = None;
+        let saved = timeout_at(
+            deadline,
+            self.snapshots
+                .read(&identity, ARTIST_GENRES_KEY, 0, false, || async {
+                    let now = crate::state::now();
+                    let mut saved = self
+                        .snapshots
+                        .peek(&identity, ARTIST_GENRES_KEY)
+                        .and_then(|value| value.as_object().cloned())
+                        .unwrap_or_default();
+                    saved.retain(|_, entry| {
+                        entry["at"]
+                            .as_u64()
+                            .is_some_and(|at| at <= now && now - at < ARTIST_GENRES_TTL)
+                    });
+                    let missing: Vec<_> =
+                        ids.iter().filter(|id| !saved.contains_key(*id)).collect();
+                    attempt.cached = ids.len() - missing.len();
+                    if missing.is_empty() {
+                        attempt.outcome = Outcome::CacheHit;
+                        return Ok(Value::Object(saved));
+                    }
+                    stage = TimeoutStage::Token;
+                    if self.account.lock().await.refresh_token.is_empty() {
+                        attempt.fail(Outcome::NoToken);
+                        return Ok(Value::Object(saved));
+                    }
+                    match self.token().await {
+                        Ok(token) if !token.is_empty() => {}
+                        Ok(_) => {
+                            attempt.fail(Outcome::NoToken);
+                            return Ok(Value::Object(saved));
+                        }
+                        Err(error) => {
+                            attempt.fail(artist_genres_error(&error));
+                            return Ok(Value::Object(saved));
                         }
                     }
-                }
-                Ok(Value::Object(saved))
-            })
-            .await?;
+                    stage = TimeoutStage::Request;
+                    let mut single = false;
+                    for batch in missing.chunks(50).take(4) {
+                        let query = [(
+                            "ids",
+                            batch
+                                .iter()
+                                .map(|id| id.as_str())
+                                .collect::<Vec<_>>()
+                                .join(","),
+                        )];
+                        attempt.asked += batch.len();
+                        let response = match self.api(Method::GET, "/artists", &query).await {
+                            Ok(response) => response,
+                            Err(error) => {
+                                single = error
+                                    .downcast_ref::<ApiFailure>()
+                                    .is_some_and(|failure| matches!(failure.status, 403 | 404));
+                                attempt.fail(artist_genres_error(&error));
+                                break;
+                            }
+                        };
+                        let Some(artists) = response["artists"].as_array() else {
+                            attempt.fail(Outcome::UnexpectedShape);
+                            break;
+                        };
+                        let mut returned = HashSet::new();
+                        for artist in artists {
+                            let id = text(artist, "id");
+                            if batch.iter().any(|requested| requested.as_str() == id)
+                                && returned.insert(id)
+                            {
+                                save_artist_genres(&mut saved, artist, &mut attempt);
+                            }
+                        }
+                        if returned.len() != batch.len() {
+                            attempt.fail(Outcome::UnexpectedShape);
+                        }
+                        collected = Some(Value::Object(saved.clone()));
+                        let _ = self.snapshots.put(
+                            &identity,
+                            ARTIST_GENRES_KEY,
+                            Value::Object(saved.clone()),
+                        );
+                    }
+                    // Development Mode no longer provides the batch endpoint.
+                    if single {
+                        for id in missing
+                            .into_iter()
+                            .filter(|id| !saved.contains_key(*id))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .iter()
+                            .take(20)
+                        {
+                            attempt.asked += 1;
+                            match self.api(Method::GET, &format!("/artists/{id}"), &[]).await {
+                                Ok(artist) if text(&artist, "id") == id => {
+                                    save_artist_genres(&mut saved, &artist, &mut attempt);
+                                    collected = Some(Value::Object(saved.clone()));
+                                    let _ = self.snapshots.put(
+                                        &identity,
+                                        ARTIST_GENRES_KEY,
+                                        Value::Object(saved.clone()),
+                                    );
+                                }
+                                Ok(_) => attempt.fail(Outcome::UnexpectedShape),
+                                Err(error) => {
+                                    let outcome = artist_genres_error(&error);
+                                    attempt.fail(outcome);
+                                    if !matches!(outcome, Outcome::Http { status: 404 }) {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(Value::Object(saved))
+                }),
+        )
+        .await;
+        let saved = match saved {
+            Ok(Ok(saved)) => saved,
+            Ok(Err(error)) => {
+                attempt.fail(artist_genres_error(&error));
+                collected
+                    .or_else(|| self.snapshots.peek(&identity, ARTIST_GENRES_KEY))
+                    .unwrap_or(Value::Null)
+            }
+            Err(_) => {
+                attempt.fail(Outcome::Timeout { stage });
+                collected
+                    .or_else(|| self.snapshots.peek(&identity, ARTIST_GENRES_KEY))
+                    .unwrap_or(Value::Null)
+            }
+        };
+        let _ = enrichment::record(&self.snapshots, &identity, "artist_genres", attempt);
         if let Some(items) = value["items"].as_array_mut() {
             for item in items {
                 if array(&item["genres"]).is_empty() {
                     if let Ok((_, id)) = reference(text(item, "artist_ref"), Some("artist")) {
-                        set_genres(item, &genres(&saved[&id]["genres"]));
+                        let entry = &saved[&id];
+                        if entry["at"].as_u64().is_some_and(|at| {
+                            let now = crate::state::now();
+                            at <= now && now - at < ARTIST_GENRES_TTL
+                        }) {
+                            set_genres(item, &genres(&entry["genres"]));
+                        }
                     }
                 }
             }
@@ -1204,13 +1360,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_artist_genres_are_cached_for_thirty_days_and_isolated_by_account() {
+    async fn empty_artist_genres_are_cached_for_thirty_days_and_isolated_by_account() {
         let page = json!({"items":[saved_artist_item("album", 1)],"total":1,"next":null});
         let (client, _directory, worker) = crate::fixtures::client(vec![
             (200, page.to_string()),
             (
                 200,
-                json!({"artists":[{"id":format!("{:022}", 1),"name":"Artist"}]}).to_string(),
+                json!({"artists":[{"id":format!("{:022}", 1),"genres":[]}]}).to_string(),
             ),
             (200, artist_reply(1, 2)),
             (200, page.to_string()),
@@ -1249,7 +1405,7 @@ mod tests {
 
     #[tokio::test]
     async fn optional_artist_failures_leave_the_library_complete_and_retry_on_later_calls() {
-        for (status, body) in [(503, "{}"), (403, "{}"), (200, "{}"), (200, "invalid")] {
+        for (status, body) in [(503, "{}"), (200, "{}"), (200, "invalid")] {
             let (client, _directory, worker) = crate::fixtures::client(vec![
                 (
                     200,
@@ -1275,6 +1431,261 @@ mod tests {
         }
     }
 
+    async fn genre_diagnostic(client: &Client) -> Value {
+        let identity = client.identity().await.unwrap();
+        client.snapshots.peek(&identity, enrichment::KEY).unwrap()["artist_genres"].clone()
+    }
+
+    fn genre_page(count: usize) -> Value {
+        json!({"items":(0..count).map(|id| json!({
+            "kind":"album", "artist_ref":format!("artist:{id:022}")
+        })).collect::<Vec<_>>()})
+    }
+
+    #[tokio::test]
+    async fn missing_genres_are_observable_and_not_negative_cached() {
+        let (client, _directory, worker) = crate::fixtures::client(vec![
+            (
+                200,
+                json!({"artists":[{"id":format!("{:022}", 0),"name":"private-name"}]}).to_string(),
+            ),
+            (
+                200,
+                json!({"artists":[{"id":format!("{:022}", 0),"genres":[]}]}).to_string(),
+            ),
+        ])
+        .await;
+        let mut page = genre_page(1);
+        client.library_genres(&mut page).await.unwrap();
+        let diagnostic = genre_diagnostic(&client).await;
+        assert_eq!(diagnostic["outcome"]["class"], "unexpected_shape");
+        assert_eq!(diagnostic["asked"], 1);
+        assert_eq!(diagnostic["with_data"], 0);
+        assert!(diagnostic["at"].as_u64().unwrap() > 0);
+        assert!(!diagnostic.to_string().contains("private-name"));
+        let identity = client.identity().await.unwrap();
+        assert!(
+            client
+                .snapshots
+                .peek(&identity, ARTIST_GENRES_KEY)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
+        client.library_genres(&mut page).await.unwrap();
+        let diagnostic = genre_diagnostic(&client).await;
+        assert_eq!(diagnostic["outcome"]["class"], "ok");
+        assert_eq!(diagnostic["asked"], 1);
+        assert_eq!(diagnostic["with_data"], 0);
+        client.library_genres(&mut page).await.unwrap();
+        let diagnostic = genre_diagnostic(&client).await;
+        assert_eq!(diagnostic["outcome"]["class"], "cache_hit");
+        assert_eq!(diagnostic["asked"], 0);
+        assert_eq!(diagnostic["cached"], 1);
+        assert_eq!(worker.join().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn unavailable_artist_batches_fall_back_to_single_artists_and_cache() {
+        for status in [403, 404] {
+            let (client, _directory, worker) = crate::fixtures::client(vec![
+                (status, "{}".into()),
+                (
+                    200,
+                    json!({"id":format!("{:022}", 0),"genres":["art rock"]}).to_string(),
+                ),
+                (
+                    200,
+                    json!({"id":format!("{:022}", 1),"genres":[]}).to_string(),
+                ),
+            ])
+            .await;
+            let mut page = genre_page(2);
+            client.library_genres(&mut page).await.unwrap();
+            assert_eq!(page["items"][0]["genre"], "art rock");
+            assert!(page["items"][1].get("genre").is_none());
+            let diagnostic = genre_diagnostic(&client).await;
+            assert_eq!(
+                diagnostic["outcome"],
+                json!({"class":"http","status":status})
+            );
+            assert_eq!(diagnostic["asked"], 4);
+            assert_eq!(diagnostic["with_data"], 1);
+            let mut cached = genre_page(2);
+            client.library_genres(&mut cached).await.unwrap();
+            assert_eq!(cached, page);
+            assert_eq!(
+                genre_diagnostic(&client).await["outcome"]["class"],
+                "cache_hit"
+            );
+            let paths = worker.join().unwrap();
+            assert_eq!(requested_artists(&paths[0]).len(), 2);
+            assert_eq!(paths[1], format!("/artists/{:022}", 0));
+            assert_eq!(paths[2], format!("/artists/{:022}", 1));
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_single_artist_does_not_block_later_fallback_results() {
+        let (client, _directory, worker) = crate::fixtures::client(vec![
+            (403, "{}".into()),
+            (404, "{}".into()),
+            (
+                200,
+                json!({"id":format!("{:022}", 1),"genres":["art rock"]}).to_string(),
+            ),
+        ])
+        .await;
+        let mut page = genre_page(2);
+        client.library_genres(&mut page).await.unwrap();
+        assert!(page["items"][0].get("genre").is_none());
+        assert_eq!(page["items"][1]["genre"], "art rock");
+        let diagnostic = genre_diagnostic(&client).await;
+        assert_eq!(diagnostic["asked"], 4);
+        assert_eq!(diagnostic["with_data"], 1);
+        assert_eq!(diagnostic["outcome"], json!({"class":"http","status":403}));
+        let saved = client
+            .snapshots
+            .peek(&client.identity().await.unwrap(), ARTIST_GENRES_KEY)
+            .unwrap();
+        assert!(saved.get(format!("{:022}", 0)).is_none());
+        assert_eq!(saved[format!("{:022}", 1)]["genres"], json!(["art rock"]));
+        let paths = worker.join().unwrap();
+        assert_eq!(paths.len(), 3);
+        assert_eq!(paths[1], format!("/artists/{:022}", 0));
+        assert_eq!(paths[2], format!("/artists/{:022}", 1));
+    }
+
+    #[tokio::test]
+    async fn artist_fallback_obeys_twenty_request_budget_and_resumes() {
+        let mut replies = vec![(403, "{}".into())];
+        for id in 0..20 {
+            replies.push((
+                200,
+                json!({"id":format!("{id:022}"),"genres":["art rock"]}).to_string(),
+            ));
+        }
+        replies.push((403, "{}".into()));
+        replies.push((
+            200,
+            json!({"id":format!("{:022}", 20),"genres":["art rock"]}).to_string(),
+        ));
+        let (client, _directory, worker) = crate::fixtures::client(replies).await;
+        let mut page = genre_page(21);
+        client.library_genres(&mut page).await.unwrap();
+        assert_eq!(
+            array(&page["items"])
+                .iter()
+                .filter(|item| item.get("genre").is_some())
+                .count(),
+            20
+        );
+        assert_eq!(genre_diagnostic(&client).await["asked"], 41);
+        client.library_genres(&mut page).await.unwrap();
+        assert!(
+            array(&page["items"])
+                .iter()
+                .all(|item| item["genre"] == "art rock")
+        );
+        assert_eq!(genre_diagnostic(&client).await["asked"], 2);
+        assert_eq!(worker.join().unwrap().len(), 23);
+    }
+
+    #[tokio::test]
+    async fn artist_genres_record_no_token_and_no_candidates_without_requests() {
+        let (client, _directory, worker) = crate::fixtures::client(vec![]).await;
+        client.account.lock().await.refresh_token.clear();
+        client.library_genres(&mut genre_page(1)).await.unwrap();
+        let diagnostic = genre_diagnostic(&client).await;
+        assert_eq!(diagnostic["outcome"]["class"], "no_token");
+        assert_eq!(diagnostic["asked"], 0);
+        client.library_genres(&mut genre_page(0)).await.unwrap();
+        assert_eq!(
+            genre_diagnostic(&client).await["outcome"]["class"],
+            "no_candidates"
+        );
+        assert!(worker.join().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn artist_genres_survive_snapshot_and_diagnostic_write_failures() {
+        let (client, directory, worker) =
+            crate::fixtures::client(vec![(200, artist_reply(0, 1))]).await;
+        let snapshots = directory.path().join("cache/snapshots");
+        std::fs::remove_dir(&snapshots).unwrap();
+        std::fs::write(&snapshots, "fixture blocks snapshot writes").unwrap();
+        let mut page = genre_page(1);
+        client.library_genres(&mut page).await.unwrap();
+        assert_eq!(page["items"][0]["genre"], "art rock, rock");
+        assert_eq!(worker.join().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn artist_deadline_includes_token_and_request_gates() {
+        let (client, _directory, worker) = crate::fixtures::client(vec![]).await;
+        let token_guard = client.primary_refresh.lock().await;
+        client
+            .library_genres_until(
+                &mut genre_page(1),
+                Instant::now() + Duration::from_millis(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            genre_diagnostic(&client).await["outcome"],
+            json!({"class":"timeout","stage":"token"})
+        );
+        drop(token_guard);
+        let permits = client.api_slots.available_permits() as u32;
+        let _guard = client.api_slots.acquire_many(permits).await.unwrap();
+        client
+            .library_genres_until(
+                &mut genre_page(1),
+                Instant::now() + Duration::from_millis(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            genre_diagnostic(&client).await["outcome"],
+            json!({"class":"timeout","stage":"request"})
+        );
+        assert!(worker.join().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn artist_deadline_includes_the_snapshot_gate() {
+        let (client, _directory, worker) = crate::fixtures::client(vec![]).await;
+        let identity = client.identity().await.unwrap();
+        let entered = tokio::sync::Notify::new();
+        let holder = client
+            .snapshots
+            .read(&identity, ARTIST_GENRES_KEY, 0, false, || async {
+                entered.notify_one();
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                Ok(json!({}))
+            });
+        let request = async {
+            entered.notified().await;
+            client
+                .library_genres_until(
+                    &mut genre_page(1),
+                    Instant::now() + Duration::from_millis(5),
+                )
+                .await
+                .unwrap();
+            let diagnostic = genre_diagnostic(&client).await;
+            assert_eq!(
+                diagnostic["outcome"],
+                json!({"class":"timeout","stage":"gate"})
+            );
+            assert_eq!(diagnostic["asked"], 0);
+        };
+        let (saved, _) = tokio::join!(holder, request);
+        saved.unwrap();
+        assert!(worker.join().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn artist_quota_failure_keeps_library_rows_and_existing_fields() {
         let (client, _directory, worker) = crate::fixtures::client(vec![
@@ -1291,6 +1702,9 @@ mod tests {
             assert_eq!(page["items"][0]["added_at"], 1704164645_i64);
             assert!(page["items"][0].get("genres").is_none());
             assert!(page.get("cached").is_none());
+            let diagnostic = genre_diagnostic(&client).await;
+            assert_eq!(diagnostic["outcome"], json!({"class":"http","status":429}));
+            assert_eq!(diagnostic["with_data"], 0);
         }
         assert_eq!(worker.join().unwrap().len(), 2);
     }

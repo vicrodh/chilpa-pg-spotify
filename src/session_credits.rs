@@ -1,5 +1,8 @@
 use crate::{
     auth::Client,
+    enrichment::{
+        self, Attempt, Outcome, TimeoutStage, graphql_error, is_disabled_error, stops_requests,
+    },
     state::{now, reference, text},
 };
 use serde::{Deserialize, Serialize};
@@ -18,7 +21,6 @@ const FOUND_TTL: u64 = 90 * 24 * 60 * 60;
 const EMPTY_TTL: u64 = 7 * 24 * 60 * 60;
 const REQUEST_LIMIT: usize = 20;
 const TIME_LIMIT: Duration = Duration::from_secs(6);
-static DISABLED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Deserialize, Serialize)]
 struct Credit {
@@ -46,6 +48,27 @@ struct Cache {
 }
 
 impl Cache {
+    fn candidates(&self, kind: &str, value: &Value) -> Vec<String> {
+        let mut seen = HashSet::new();
+        value["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|item| {
+                if kind == "tracks" {
+                    item_id(item, "track").into_iter().collect::<Vec<_>>()
+                } else {
+                    item_id(item, "album")
+                        .and_then(|id| self.albums.get(&id))
+                        .cloned()
+                        .unwrap_or_default()
+                }
+            })
+            .filter(|id| reference(&format!("track:{id}"), Some("track")).is_ok())
+            .filter(|id| seen.insert(id.clone()))
+            .collect()
+    }
+
     fn remember(&mut self, album: &str, tracks: impl IntoIterator<Item = String>) {
         let known = self.albums.entry(album.into()).or_default();
         for track in tracks {
@@ -119,38 +142,44 @@ fn query(id: &str) -> Value {
 #[derive(Debug, PartialEq)]
 enum Reply {
     Credits(Vec<String>),
-    Failed,
-    Stop,
+    Failed(Outcome),
 }
 
 fn parse(value: &Value, disabled: &AtomicBool) -> Reply {
-    if let Some(errors) = value
-        .get("errors")
-        .filter(|e| !e.is_null() && e.as_array().is_none_or(|errors| !errors.is_empty()))
-    {
-        if errors.to_string().contains("PersistedQueryNotFound") {
+    if let Some(outcome) = graphql_error(value) {
+        if is_disabled_error(&outcome) {
             disabled.store(true, Ordering::Relaxed);
-            return Reply::Stop;
         }
-        return Reply::Failed;
+        return Reply::Failed(outcome);
     }
     let Some(items) = value
         .pointer("/data/trackUnion/creditsTrait/contributors/items")
         .and_then(Value::as_array)
     else {
-        return Reply::Failed;
+        return Reply::Failed(Outcome::UnexpectedShape);
     };
     let mut names = Vec::new();
     for item in items {
-        let (Some(name), Some(role), Some(group)) = (
-            item["name"].as_str(),
-            item["role"].as_str(),
-            item.pointer("/roleGroup/name").and_then(Value::as_str),
-        ) else {
-            return Reply::Failed;
+        let Some(name) = item["name"].as_str() else {
+            return Reply::Failed(Outcome::UnexpectedShape);
+        };
+        // The player permits a missing role or role group.
+        let role = match &item["role"] {
+            Value::Null => "",
+            Value::String(role) => role,
+            _ => return Reply::Failed(Outcome::UnexpectedShape),
+        };
+        let group = match &item["roleGroup"] {
+            Value::Null => "",
+            Value::Object(group) => match group.get("name") {
+                None | Some(Value::Null) => "",
+                Some(Value::String(name)) => name,
+                _ => return Reply::Failed(Outcome::UnexpectedShape),
+            },
+            _ => return Reply::Failed(Outcome::UnexpectedShape),
         };
         if name.trim().is_empty() {
-            return Reply::Failed;
+            return Reply::Failed(Outcome::UnexpectedShape);
         }
         let role = role.to_ascii_lowercase();
         let group = group.to_ascii_lowercase();
@@ -189,8 +218,13 @@ impl Client {
     }
 
     pub(crate) async fn library_composers(&self, kind: &str, value: &mut Value) {
-        self.composers_until(kind, value, Instant::now() + TIME_LIMIT, &DISABLED)
-            .await;
+        self.composers_until(
+            kind,
+            value,
+            Instant::now() + TIME_LIMIT,
+            &self.credits_disabled,
+        )
+        .await;
     }
 
     async fn composers_until(
@@ -203,7 +237,28 @@ impl Client {
         let Ok(Ok(identity)) = timeout_at(deadline, self.identity()).await else {
             return;
         };
+        let mut attempt = Attempt::start();
         let Ok(_guard) = timeout_at(deadline, self.credits_gate.lock()).await else {
+            let saved: Cache = self
+                .snapshots
+                .peek(&identity, CACHE_KEY)
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_default();
+            attempt.cached = saved
+                .candidates(kind, value)
+                .iter()
+                .filter(|id| {
+                    saved
+                        .tracks
+                        .get(*id)
+                        .is_some_and(|credit| credit.fresh(now()))
+                })
+                .count();
+            saved.apply(kind, value);
+            attempt.fail(Outcome::Timeout {
+                stage: TimeoutStage::Gate,
+            });
+            let _ = enrichment::record(&self.snapshots, &identity, "track_credits", attempt);
             return;
         };
         let mut saved: Cache = self
@@ -252,14 +307,20 @@ impl Client {
             }
         }
         saved.apply(kind, value);
-        let mut seen = HashSet::new();
-        let mut missing: Vec<_> = value["items"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|item| item_id(item, "track"))
-            .filter(|id| !saved.tracks.contains_key(id) && seen.insert(id.clone()))
+        let candidates = saved.candidates(kind, value);
+        let mut missing: Vec<_> = candidates
+            .iter()
+            .filter(|id| !saved.tracks.contains_key(*id))
+            .cloned()
             .collect();
+        attempt.cached = candidates.len() - missing.len();
+        if missing.is_empty() {
+            attempt.outcome = if candidates.is_empty() {
+                Outcome::NoCandidates
+            } else {
+                Outcome::CacheHit
+            };
+        }
         if let Some(index) = missing
             .iter()
             .position(|id| Some(id) == saved.after.as_ref())
@@ -267,27 +328,67 @@ impl Client {
             let start = (index + 1) % missing.len();
             missing.rotate_left(start);
         }
-        if kind == "tracks" && !missing.is_empty() && !disabled.load(Ordering::Relaxed) {
-            // Session setup, token reads and response bodies share the same deadline.
-            if let Ok(Ok(tokens)) = timeout_at(deadline, self.partner_tokens()).await {
-                for id in missing.iter().take(REQUEST_LIMIT) {
-                    if Instant::now() >= deadline || disabled.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    saved.after = Some(id.clone());
-                    match timeout_at(deadline, self.track_credit(id, &tokens, disabled)).await {
-                        Ok(Reply::Credits(composers)) => {
-                            saved.tracks.insert(
-                                id.clone(),
-                                Credit {
-                                    at: now(),
-                                    composers,
-                                },
-                            );
+        if !missing.is_empty() {
+            if disabled.load(Ordering::Relaxed) {
+                attempt.fail(Outcome::Disabled);
+            } else {
+                match self.enrichment_tokens(deadline).await {
+                    Ok(tokens) => {
+                        for id in missing.iter().take(REQUEST_LIMIT) {
+                            let remaining = timeout_at(deadline, async {
+                                self.partner_limits.lock().await.remaining("/credits")
+                            })
+                            .await;
+                            match remaining {
+                                Ok(0) => {}
+                                Ok(_) => {
+                                    attempt.fail(Outcome::Http { status: 429 });
+                                    break;
+                                }
+                                Err(_) => {
+                                    attempt.fail(Outcome::Timeout {
+                                        stage: TimeoutStage::Request,
+                                    });
+                                    break;
+                                }
+                            }
+                            if Instant::now() >= deadline {
+                                attempt.fail(Outcome::Timeout {
+                                    stage: TimeoutStage::Request,
+                                });
+                                break;
+                            }
+                            saved.after = Some(id.clone());
+                            attempt.asked += 1;
+                            match timeout_at(deadline, self.track_credit(id, &tokens, disabled))
+                                .await
+                            {
+                                Ok(Reply::Credits(composers)) => {
+                                    attempt.with_data += usize::from(!composers.is_empty());
+                                    saved.tracks.insert(
+                                        id.clone(),
+                                        Credit {
+                                            at: now(),
+                                            composers,
+                                        },
+                                    );
+                                }
+                                Ok(Reply::Failed(outcome)) => {
+                                    attempt.fail(outcome);
+                                    if stops_requests(&outcome) {
+                                        break;
+                                    }
+                                }
+                                Err(_) => {
+                                    attempt.fail(Outcome::Timeout {
+                                        stage: TimeoutStage::Request,
+                                    });
+                                    break;
+                                }
+                            }
                         }
-                        Ok(Reply::Failed) => {}
-                        Ok(Reply::Stop) | Err(_) => break,
                     }
+                    Err(outcome) => attempt.fail(outcome),
                 }
             }
         }
@@ -295,6 +396,7 @@ impl Client {
         if let Ok(cache) = serde_json::to_value(&saved) {
             let _ = self.snapshots.put(&identity, CACHE_KEY, cache);
         }
+        let _ = enrichment::record(&self.snapshots, &identity, "track_credits", attempt);
     }
 
     async fn track_credit(
@@ -303,33 +405,14 @@ impl Client {
         tokens: &(String, String),
         disabled: &AtomicBool,
     ) -> Reply {
-        if self.partner_limits.lock().await.remaining("/credits") > 0 {
-            return Reply::Stop;
-        }
-        let Ok(response) = self.partner_request(tokens).json(&query(id)).send().await else {
-            return Reply::Failed;
-        };
-        if response.status().as_u16() == 429 {
-            let seconds = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(60);
-            self.partner_limits
-                .lock()
-                .await
-                .record("/credits", seconds, false);
-            return Reply::Stop;
-        }
-        let success = response.status().is_success();
-        match Self::response_json(response).await {
-            Ok(value) => match parse(&value, disabled) {
-                Reply::Stop => Reply::Stop,
-                reply if success => reply,
-                _ => Reply::Failed,
-            },
-            Err(_) => Reply::Failed,
+        match self.enrichment_query(&query(id), tokens, "/credits").await {
+            Ok(value) => parse(&value, disabled),
+            Err(outcome) => {
+                if is_disabled_error(&outcome) {
+                    disabled.store(true, Ordering::Relaxed);
+                }
+                Reply::Failed(outcome)
+            }
         }
     }
 }
@@ -501,13 +584,136 @@ mod tests {
             json!({"data":null}),
             credits(json!({})),
             credits(json!([null])),
-            credits(json!([{"name":"Incomplete","role":"Composer"}])),
+            credits(json!([{"name":"Writer","role":{"name":"Composer"}}])),
+            credits(json!([{"name":"Writer","roleGroup":[]}])),
+            credits(json!([{"name":"Writer","roleGroup":{"name":42}}])),
             credits(json!([{"name":" ","role":"Composer","roleGroup":{"name":"Writers"}}])),
-            json!({"errors":[{"message":"Denied"}]}),
         ] {
-            assert_eq!(parse(&value, &disabled), Reply::Failed);
+            assert_eq!(
+                parse(&value, &disabled),
+                Reply::Failed(Outcome::UnexpectedShape)
+            );
         }
         assert!(!disabled.load(Ordering::Relaxed));
+        assert_eq!(
+            parse(
+                &credits(json!([
+                    {"name":"Writer","role":"Composer","roleGroup":null},
+                    {"name":"Lyricist","role":null,"roleGroup":{"name":"Writers"}},
+                    {"name":"Singer","role":null,"roleGroup":null}
+                ])),
+                &disabled
+            ),
+            Reply::Credits(vec!["Writer".into(), "Lyricist".into()])
+        );
+    }
+
+    #[tokio::test]
+    async fn album_only_listings_fetch_known_tracks_with_the_same_budget() {
+        let (client, _directory, worker) = fixture(
+            (0..25)
+                .map(|i| immediate(200, reply(&format!("Writer {i}"))))
+                .collect(),
+        )
+        .await;
+        client.remember_album_tracks(&[json!({"album":{
+            "id":id(100),"tracks":{"items":(0..25).map(|i| json!({"id":id(i)})).collect::<Vec<_>>()}
+        }})]).await;
+        seed_page(
+            &client,
+            "albums",
+            vec![
+                json!({"ref":format!("album:{}",id(100)),"label":"Existing"}),
+                json!({"ref":format!("album:{}",id(100)),"label":"Existing"}),
+            ],
+        )
+        .await;
+        let identity = client.identity().await.unwrap();
+        let params = json!({"kind":"albums"});
+        let first = client.library(&params).await.unwrap();
+        assert_eq!(first["items"][0]["composers"].as_array().unwrap().len(), 20);
+        let diagnostic = client.snapshots.peek(&identity, enrichment::KEY).unwrap();
+        assert_eq!(diagnostic["track_credits"]["asked"], 20);
+        assert_eq!(diagnostic["track_credits"]["with_data"], 20);
+        assert_eq!(diagnostic["track_credits"]["outcome"]["class"], "ok");
+        let second = client.library(&params).await.unwrap();
+        assert_eq!(
+            second["items"][0]["composers"].as_array().unwrap().len(),
+            25
+        );
+        assert_eq!(second["items"][0], second["items"][1]);
+        assert_eq!(client.library(&params).await.unwrap(), second);
+        let diagnostic = client.snapshots.peek(&identity, enrichment::KEY).unwrap();
+        assert_eq!(diagnostic["track_credits"]["asked"], 0);
+        assert_eq!(diagnostic["track_credits"]["cached"], 25);
+        assert_eq!(diagnostic["track_credits"]["outcome"]["class"], "cache_hit");
+        assert_eq!(worker.join().unwrap().len(), 25);
+    }
+
+    #[tokio::test]
+    async fn credit_diagnostics_distinguish_http_graphql_shape_and_empty_answers() {
+        for (status, body, outcome) in [
+            (
+                403,
+                "private body".into(),
+                json!({"class":"http","status":403}),
+            ),
+            (429, "{}".into(), json!({"class":"http","status":429})),
+            (200, "{}".into(), json!({"class":"unexpected_shape"})),
+            (
+                200,
+                json!({"errors":[{"extensions":{"code":"FORBIDDEN"},"message":"private"}]})
+                    .to_string(),
+                json!({"class":"graphql","code":"FORBIDDEN"}),
+            ),
+            (200, credits(json!([])).to_string(), json!({"class":"ok"})),
+        ] {
+            let (client, _directory, worker) = fixture(vec![immediate(status, body)]).await;
+            let mut value = json!({"items":[track(1)]});
+            client.library_composers("tracks", &mut value).await;
+            let diagnostic = client
+                .snapshots
+                .peek(&client.identity().await.unwrap(), enrichment::KEY)
+                .unwrap();
+            assert_eq!(diagnostic["track_credits"]["outcome"], outcome);
+            assert_eq!(diagnostic["track_credits"]["asked"], 1);
+            assert_eq!(diagnostic["track_credits"]["with_data"], 0);
+            assert_eq!(value["items"][0], track(1));
+            assert!(!diagnostic.to_string().contains("private"));
+            assert_eq!(worker.join().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn credit_gate_timeout_and_missing_session_are_recorded_without_requests() {
+        let (client, _directory, worker) = crate::fixtures::client(vec![]).await;
+        let identity = client.identity().await.unwrap();
+        let mut value = json!({"items":[track(1)]});
+        client.library_composers("tracks", &mut value).await;
+        assert_eq!(
+            client.snapshots.peek(&identity, enrichment::KEY).unwrap()["track_credits"]["outcome"]
+                ["class"],
+            "no_session"
+        );
+        save_cache(&client, vec![(1, now(), vec!["Cached"])]).await;
+        let _guard = client.credits_gate.lock().await;
+        client
+            .composers_until(
+                "tracks",
+                &mut value,
+                Instant::now() + Duration::from_millis(20),
+                &client.credits_disabled,
+            )
+            .await;
+        let diagnostic = client.snapshots.peek(&identity, enrichment::KEY).unwrap();
+        assert_eq!(
+            diagnostic["track_credits"]["outcome"],
+            json!({"class":"timeout","stage":"gate"})
+        );
+        assert_eq!(diagnostic["track_credits"]["asked"], 0);
+        assert_eq!(diagnostic["track_credits"]["cached"], 1);
+        assert_eq!(value["items"][0]["composers"], json!(["Cached"]));
+        assert!(worker.join().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -722,6 +928,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn graphql_rate_limit_stops_and_preserves_the_pause() {
+        let (client, _directory, worker) = fixture(vec![immediate(
+            200,
+            json!({"errors":[{"extensions":{"code":"RATE_LIMITED"}}]}).to_string(),
+        )])
+        .await;
+        let mut value = json!({"items":[track(1), track(2)]});
+        client.library_composers("tracks", &mut value).await;
+        let identity = client.identity().await.unwrap();
+        let diagnostic = client.snapshots.peek(&identity, enrichment::KEY).unwrap();
+        assert_eq!(
+            diagnostic["track_credits"]["outcome"],
+            json!({"class":"graphql","code":"RATE_LIMITED"})
+        );
+        assert_eq!(diagnostic["track_credits"]["asked"], 1);
+        client.library_composers("tracks", &mut value).await;
+        let diagnostic = client.snapshots.peek(&identity, enrichment::KEY).unwrap();
+        assert_eq!(
+            diagnostic["track_credits"]["outcome"],
+            json!({"class":"http","status":429})
+        );
+        assert_eq!(diagnostic["track_credits"]["asked"], 0);
+        assert_eq!(worker.join().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn one_wall_deadline_cancels_slow_requests_and_keeps_earlier_answers() {
         let (client, _directory, worker) = fixture(vec![
             (200, reply("First"), Duration::from_millis(300)),
@@ -859,8 +1091,8 @@ mod tests {
             &client,
             "albums",
             vec![
-                json!({"kind":"album","ref":format!("album:{}", id(100))}),
-                json!({"kind":"album","ref":format!("album:{}", id(101))}),
+                json!({"kind":"album","ref":format!("album:{}", id(100)),"label":"Existing"}),
+                json!({"kind":"album","ref":format!("album:{}", id(101)),"label":"Existing"}),
             ],
         )
         .await;
@@ -886,7 +1118,7 @@ mod tests {
 
     #[tokio::test]
     async fn albums_use_embedded_and_previously_cached_record_tracks() {
-        let (client, _directory, worker) = fixture(vec![]).await;
+        let (client, _directory, worker) = fixture(vec![immediate(200, reply("New"))]).await;
         save_cache(
             &client,
             vec![
@@ -899,7 +1131,7 @@ mod tests {
         let identity = client.identity().await.unwrap();
         let album = |index| {
             json!({"album":{
-                "id":id(index),"tracks":{"items":[{"id":id(2)},{"id":id(1)},{"id":id(3)}]}
+                "id":id(index),"label":"Existing","tracks":{"items":[{"id":id(2)},{"id":id(1)},{"id":id(3)}]}
             }})
         };
         let query = [("limit", "50"), ("offset", "0")];
@@ -926,7 +1158,7 @@ mod tests {
         let value = client.library(&json!({"kind":"albums"})).await.unwrap();
         assert_eq!(
             value["items"][0]["composers"],
-            json!(["Shared", "Last", "First"])
+            json!(["Shared", "Last", "First", "New"])
         );
         client
             .snapshots
@@ -950,7 +1182,7 @@ mod tests {
             (101..103)
                 .map(|index| {
                     json!({
-                        "kind":"album","ref":format!("album:{}", id(index))
+                        "kind":"album","ref":format!("album:{}", id(index)),"label":"Existing"
                     })
                 })
                 .collect(),
@@ -963,8 +1195,8 @@ mod tests {
         );
         assert_eq!(
             value["items"][1]["composers"],
-            json!(["Shared", "Last", "First"])
+            json!(["Shared", "Last", "First", "New"])
         );
-        assert!(worker.join().unwrap().is_empty());
+        assert_eq!(worker.join().unwrap().len(), 1);
     }
 }

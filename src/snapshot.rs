@@ -47,6 +47,7 @@ fn stale(mut value: Value, at: u64) -> Value {
 pub struct Store {
     root: PathBuf,
     gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    updates: std::sync::Mutex<()>,
 }
 
 #[cfg(test)]
@@ -208,6 +209,18 @@ impl Store {
             })?,
         )
     }
+    pub fn update(
+        &self,
+        identity: &str,
+        key: &str,
+        merge: impl FnOnce(Option<Value>) -> Value,
+    ) -> Result<()> {
+        let _guard = self
+            .updates
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.put(identity, key, merge(self.peek(identity, key)))
+    }
     pub fn new(root: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&root)?;
         #[cfg(unix)]
@@ -218,6 +231,7 @@ impl Store {
         Ok(Self {
             root,
             gates: Mutex::new(HashMap::new()),
+            updates: std::sync::Mutex::new(()),
         })
     }
 

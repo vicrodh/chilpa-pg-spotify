@@ -2,6 +2,7 @@ mod auth;
 mod callback;
 mod catalog;
 mod discover;
+mod enrichment;
 #[cfg(test)]
 mod fixtures;
 mod i18n;
@@ -11,7 +12,9 @@ mod native_catalog;
 mod playlist_actions;
 mod radio;
 mod session_credits;
+mod session_enrichment;
 mod session_home;
+mod session_labels;
 mod session_playlists;
 mod snapshot;
 mod state;

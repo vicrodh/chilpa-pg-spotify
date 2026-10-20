@@ -95,6 +95,22 @@ outbound firewall for librespot's regional access points and audio CDNs.
 
 ## Limits
 
+- Library enrichment is optional. Album copyright lines and track composers each
+  use at most 20 requests and six seconds per listing, including session setup.
+  Found answers are cached for 90 days, empty answers for seven days. Albums use
+  known track membership to collect composers; unknown tracks are not fetched.
+  Copyright text fills a missing label verbatim and has `label_source: "copyright"`;
+  it is not a normalized record-label name.
+- Artist genres use the Web API when supplied. A denied or missing batch endpoint
+  falls back to at most 20 individual artists within six seconds. Missing fields
+  are not treated as empty answers or inferred from other metadata.
+- The account snapshot `library-enrichment:v1` records `artist_genres`,
+  `album_label`, and `track_credits`. Each contains Unix seconds in `at`, a fixed
+  `outcome`, `asked`, `with_data`, and `cached` counts. The first failure in a call
+  remains visible even if later requests succeed. A batch and its single-artist
+  fallback both count toward `asked`; cached answers count separately.
+  No response text, headers, tokens, item IDs, or names enter this diagnostic
+  payload. `cache_hit` and `no_candidates` describe calls without new lookups.
 - Vorbis playback is lossy. Lossless delivery, Spotify Connect receiver control,
   remote queue mirroring, podcasts and offline downloads are not implemented.
 - Playlist writes are limited to creation and adding up to 100 tracks per request

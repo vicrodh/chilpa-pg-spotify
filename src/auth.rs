@@ -112,6 +112,9 @@ pub struct Client {
     pub(crate) snapshots: crate::snapshot::Store,
     pub(crate) library_reauth: AtomicBool,
     pub(crate) credits_gate: Mutex<()>,
+    pub(crate) labels_gate: Mutex<()>,
+    pub(crate) credits_disabled: AtomicBool,
+    pub(crate) labels_disabled: AtomicBool,
     #[cfg(test)]
     pub(crate) partner_fixture: Option<String>,
 }
@@ -166,6 +169,9 @@ impl Client {
             snapshots,
             library_reauth: AtomicBool::new(false),
             credits_gate: Mutex::new(()),
+            labels_gate: Mutex::new(()),
+            credits_disabled: AtomicBool::new(false),
+            labels_disabled: AtomicBool::new(false),
             #[cfg(test)]
             partner_fixture: None,
         })
