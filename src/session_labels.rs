@@ -109,7 +109,25 @@ fn parse(value: &Value) -> Result<Option<String>, Outcome> {
     } else {
         phonographic
     };
-    Ok((!lines.is_empty()).then(|| lines.join(" / ")))
+    // The label is who owns the recording: the first line, without its mark
+    // and its years.
+    Ok(lines.first().map(|line| owner(line)).filter(|name| !name.is_empty()))
+}
+
+/// "℗ 2017 JKP GmbH & Co. KG" as "JKP GmbH & Co. KG".
+fn owner(line: &str) -> String {
+    let mut rest = line.trim();
+    for mark in ["℗", "©", "(P)", "(p)", "(C)", "(c)"] {
+        if let Some(after) = rest.strip_prefix(mark) {
+            rest = after.trim_start();
+        }
+    }
+    while rest.len() >= 4 && rest.as_bytes()[..4].iter().all(u8::is_ascii_digit)
+        && rest.as_bytes().get(4).is_none_or(|next| !next.is_ascii_digit())
+    {
+        rest = rest[4..].trim_start_matches(|c: char| c == '-' || c == '\u{2013}' || c == ',' || c == '/' || c.is_whitespace());
+    }
+    rest.trim().to_string()
 }
 
 impl Client {
@@ -289,7 +307,7 @@ mod tests {
             .unwrap();
         let params = json!({"kind":"albums"});
         let first = client.library(&params).await.unwrap();
-        assert_eq!(first["items"][0]["label"], "2026 Example Records");
+        assert_eq!(first["items"][0]["label"], "Example Records");
         assert_eq!(first["items"][0]["label_source"], "copyright");
         assert_eq!(client.library(&params).await.unwrap(), first);
         let diagnostic = client
@@ -384,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    fn copyright_text_is_verbatim_and_never_inferred_from_courtesy() {
+    fn the_label_is_the_recording_owner_and_never_inferred_from_courtesy() {
         assert_eq!(
             parse(&reply(json!([
                 {"type":"C","text":"2025 Other owner"},
@@ -392,14 +410,18 @@ mod tests {
                 {"type":"P","text":"2026 Second owner"},
                 {"type":"P","text":"2026 Example Records"}
             ]))),
-            Ok(Some("2026 Example Records / 2026 Second owner".into()))
+            Ok(Some("Example Records".into()))
         );
         assert_eq!(
             parse(&reply(
                 json!([{"type":"C","text":" 2026 Example Records "}])
             )),
-            Ok(Some(" 2026 Example Records ".into()))
+            Ok(Some("Example Records".into()))
         );
+        for (line, owner) in [("\u{2117} 2017 JKP GmbH & Co. KG", Some("JKP GmbH & Co. KG")), ("(P) 2010-2012 Example", Some("Example")),
+            ("\u{a9} 2019, 2020 4AD Ltd", Some("4AD Ltd")), ("2017", None)] {
+            assert_eq!(parse(&reply(json!([{"type":"P","text":line}]))), Ok(owner.map(String::from)), "{line}");
+        }
         let mut empty = reply(json!([]));
         empty["data"]["albumUnion"]["courtesyLine"] = json!("Courtesy of an artist");
         assert_eq!(parse(&empty), Ok(None));
@@ -428,10 +450,10 @@ mod tests {
         let page = json!({"items":items,"total":27});
         let mut first = page.clone();
         client.library_labels(&mut first).await;
-        assert_eq!(first["items"][0]["label"], "2026 Example Records");
+        assert_eq!(first["items"][0]["label"], "Example Records");
         assert_eq!(first["items"][0]["label_source"], "copyright");
         assert!(first["items"][20].get("label").is_none());
-        assert_eq!(first["items"][25]["label"], "2026 Example Records");
+        assert_eq!(first["items"][25]["label"], "Example Records");
         assert_eq!(first["items"][26], existing);
         assert_eq!(diagnostic(&client).await["asked"], 20);
         assert_eq!(diagnostic(&client).await["with_data"], 20);
@@ -496,14 +518,14 @@ mod tests {
         assert_eq!(diagnostic(&client).await["outcome"]["class"], "cache_hit");
         save(&client, vec![(1, now() - EMPTY_TTL, None)]).await;
         client.library_labels(&mut page).await;
-        assert_eq!(page["items"][0]["label"], "2026 Example Records");
+        assert_eq!(page["items"][0]["label"], "Example Records");
         save(
             &client,
             vec![(1, now() - FOUND_TTL, Some("Expired copyright"))],
         )
         .await;
         client.library_labels(&mut page).await;
-        assert_eq!(page["items"][0]["label"], "2026 Example Records");
+        assert_eq!(page["items"][0]["label"], "Example Records");
         assert_eq!(diagnostic(&client).await["asked"], 1);
         assert_eq!(worker.join().unwrap().len(), 3);
     }
@@ -533,7 +555,7 @@ mod tests {
         let mut page = json!({"items":(0..7).map(album).collect::<Vec<_>>(),"total":7});
         client.library_labels(&mut page).await;
         assert!(page.get("partial").is_none());
-        assert_eq!(page["items"][6]["label"], "2026 Example Records");
+        assert_eq!(page["items"][6]["label"], "Example Records");
         assert!(
             page["items"].as_array().unwrap()[..6]
                 .iter()
@@ -597,7 +619,7 @@ mod tests {
             )
             .await;
         assert!(started.elapsed() < Duration::from_secs(1));
-        assert_eq!(page["items"][0]["label"], "2026 Example Records");
+        assert_eq!(page["items"][0]["label"], "Example Records");
         assert!(page["items"][1].get("label").is_none());
         assert_eq!(diagnostic(&client).await["asked"], 2);
         assert_eq!(
