@@ -41,6 +41,7 @@ pub async fn routed(
         directory.path().join("cache"),
     )
     .unwrap();
+    client.token_endpoint = format!("{address}/token");
     client.api_base = address;
     *client.account.lock().await = Account {
         user: "test".into(),
@@ -78,6 +79,7 @@ pub async fn client(
         directory.path().join("cache"),
     )
     .unwrap();
+    client.token_endpoint = format!("{address}/token");
     client.api_base = address;
     *client.account.lock().await = Account {
         user: "test".into(),

@@ -3,8 +3,46 @@ use crate::{
     state::{reference, text},
 };
 use anyhow::{Context, Result, bail};
+use librespot_core::date::Date;
 use reqwest::Method;
 use serde_json::{Value, json};
+use std::collections::HashSet;
+
+const ARTIST_GENRES_KEY: &str = "artist-genres:v1";
+const ARTIST_GENRES_TTL: u64 = 30 * 24 * 60 * 60;
+
+fn genres(value: &Value) -> Vec<String> {
+    let mut names = Vec::new();
+    for name in array(value).iter().filter_map(Value::as_str) {
+        if !name.trim().is_empty()
+            && !name.trim().eq_ignore_ascii_case("music")
+            && !names.iter().any(|v| v == name)
+        {
+            names.push(name.to_owned());
+        }
+    }
+    // Put named subgenres before their parent.
+    let parents = names.clone();
+    names.sort_by_key(|name| {
+        std::cmp::Reverse(
+            parents
+                .iter()
+                .filter(|parent| {
+                    name.strip_suffix(parent.as_str())
+                        .is_some_and(|prefix| prefix.ends_with(' '))
+                })
+                .count(),
+        )
+    });
+    names
+}
+
+fn set_genres(item: &mut Value, names: &[String]) {
+    if !names.is_empty() {
+        item["genres"] = json!(names);
+        item["genre"] = json!(names.join(", "));
+    }
+}
 
 pub fn card(raw: &Value, kind: &str) -> Option<Value> {
     if !raw.is_object() {
@@ -53,6 +91,25 @@ pub fn card(raw: &Value, kind: &str) -> Option<Value> {
             item["year"] = json!(year);
         }
     }
+    if matches!(kind, "album" | "track") {
+        let record = if kind == "track" { album } else { raw };
+        let mut names = genres(&raw["genres"]);
+        if names.is_empty() {
+            names = genres(&record["genres"]);
+        }
+        set_genres(&mut item, &names);
+        if let Some(label) = raw["label"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| record["label"].as_str().filter(|s| !s.trim().is_empty()))
+        {
+            item["label"] = json!(label);
+        }
+        let release_type = text(record, "album_type");
+        if matches!(release_type, "album" | "single" | "compilation") {
+            item["release_type"] = json!(release_type);
+        }
+    }
     if let Some(isrc) = raw["external_ids"]["isrc"].as_str() {
         item["isrc"] = json!(isrc);
     }
@@ -64,6 +121,18 @@ pub fn card(raw: &Value, kind: &str) -> Option<Value> {
         item["owner_id"] = raw["owner"]["id"].clone();
         item["editable"] = json!(false);
         item["copyable"] = json!(false);
+    }
+    Some(item)
+}
+
+fn library_card(raw: &Value, kind: &str) -> Option<Value> {
+    let saved = matches!(kind, "albums" | "tracks");
+    let singular = kind.trim_end_matches('s');
+    let mut item = card(if saved { &raw[singular] } else { raw }, singular)?;
+    if saved {
+        if let Ok(date) = Date::from_iso8601(text(raw, "added_at")) {
+            item["added_at"] = json!(date.unix_timestamp());
+        }
     }
     Some(item)
 }
@@ -286,15 +355,88 @@ impl Client {
 
     pub async fn library(&self, params: &Value) -> Result<Value> {
         let mut value = self.library_inner(params).await?;
+        if matches!(text(params, "kind"), "albums" | "tracks") {
+            // Enrich cached pages too, so later calls can fill the remaining artists.
+            let _ = self.library_genres(&mut value).await;
+        }
         self.project_playlist_permissions(&mut value, "items").await;
         Ok(value)
+    }
+
+    async fn library_genres(&self, value: &mut Value) -> Result<()> {
+        let mut seen = HashSet::new();
+        let ids: Vec<_> = array(&value["items"])
+            .iter()
+            .filter(|item| array(&item["genres"]).is_empty())
+            .filter_map(|item| reference(text(item, "artist_ref"), Some("artist")).ok())
+            .map(|(_, id)| id)
+            .filter(|id| seen.insert(id.clone()))
+            .collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let identity = self.identity().await?;
+        let saved = self
+            .snapshots
+            .read(&identity, ARTIST_GENRES_KEY, 0, false, || async {
+                let now = crate::state::now();
+                let mut saved = self
+                    .snapshots
+                    .peek(&identity, ARTIST_GENRES_KEY)
+                    .and_then(|value| value.as_object().cloned())
+                    .unwrap_or_default();
+                saved.retain(|_, entry| {
+                    entry["at"]
+                        .as_u64()
+                        .is_some_and(|at| at <= now && now - at < ARTIST_GENRES_TTL)
+                });
+                let missing: Vec<_> = ids.iter().filter(|id| !saved.contains_key(*id)).collect();
+                for batch in missing.chunks(50).take(4) {
+                    let query = [(
+                        "ids",
+                        batch.iter().map(|id| id.as_str()).collect::<Vec<_>>().join(","),
+                    )];
+                    let Ok(response) = self.api(Method::GET, "/artists", &query).await else {
+                        break;
+                    };
+                    let Some(artists) = response["artists"].as_array() else {
+                        break;
+                    };
+                    for artist in artists {
+                        let id = text(artist, "id");
+                        if batch.iter().any(|requested| requested.as_str() == id) {
+                            saved.insert(
+                                id.into(),
+                                json!({"at":crate::state::now(),"genres":genres(&artist["genres"])}),
+                            );
+                        }
+                    }
+                }
+                Ok(Value::Object(saved))
+            })
+            .await?;
+        if let Some(items) = value["items"].as_array_mut() {
+            for item in items {
+                if array(&item["genres"]).is_empty() {
+                    if let Ok((_, id)) = reference(text(item, "artist_ref"), Some("artist")) {
+                        set_genres(item, &genres(&saved[&id]["genres"]));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn library_inner(&self, params: &Value) -> Result<Value> {
         let kind = text(params, "kind");
         let (offset, limit) = paging(params);
+        let schema = if matches!(kind, "albums" | "tracks") {
+            ":fields-v1"
+        } else {
+            ""
+        };
         self.cached(
-            &format!("library:{kind}:{offset}:{limit}"),
+            &format!("library:{kind}:{offset}:{limit}{schema}"),
             if kind == "playlists" { 1800 } else { 21600 },
             params["refresh"].as_bool().unwrap_or(false),
             || self.library_fetch(params),
@@ -352,12 +494,7 @@ impl Client {
                 .context("Spotify returned an invalid library page.")?;
             for raw in batch {
                 if position >= offset && output.len() < limit {
-                    let raw = match kind {
-                        "tracks" => &raw["track"],
-                        "albums" => &raw["album"],
-                        _ => raw,
-                    };
-                    if let Some(item) = card(raw, kind.trim_end_matches('s')) {
+                    if let Some(item) = library_card(raw, kind) {
                         output.push(item);
                     }
                 }
@@ -700,6 +837,484 @@ pub fn link(value: &str) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_albums_keep_record_fields_and_saved_seconds() {
+        let raw = json!({
+            "added_at":"2024-01-02T03:04:05Z",
+            "album":{
+                "id":"1234567890123456789012","name":"Record",
+                "artists":[{"id":"abcdefghijklmnopqrstuv","name":"Artist"}],
+                "images":[{"url":"cover"}],"total_tracks":12,
+                "release_date":"1998-06-15","album_type":"compilation",
+                "genres":["Music","rock","indie rock"],"label":"Example Records"
+            }
+        });
+        assert_eq!(
+            library_card(&raw, "albums").unwrap(),
+            json!({
+                "kind":"album","ref":"album:1234567890123456789012","title":"Record",
+                "artist":"Artist","artist_ref":"artist:abcdefghijklmnopqrstuv",
+                "image":"cover","description":"","tracks":12,
+                "year":1998,"release_date":"1998-06-15",
+                "genres":["indie rock","rock"],"genre":"indie rock, rock",
+                "label":"Example Records","release_type":"compilation","added_at":1704164645
+            })
+        );
+    }
+
+    #[test]
+    fn saved_tracks_inherit_record_fields_and_keep_playback_metadata() {
+        let raw = json!({
+            "added_at":"2024-01-01T21:04:05-06:00",
+            "track":{
+                "id":"1234567890123456789012","name":"Song",
+                "artists":[{"id":"abcdefghijklmnopqrstuv","name":"Artist"}],
+                "duration_ms":123000,"track_number":2,"disc_number":1,
+                "explicit":false,"is_playable":true,"external_ids":{"isrc":"TEST12345678"},
+                "album":{
+                    "id":"abcdefghijklmnopqrstuv","name":"Record","images":[{"url":"cover"}],
+                    "release_date":"1998","album_type":"single",
+                    "genres":["chamber pop"],"label":"Example Records"
+                }
+            }
+        });
+        assert_eq!(
+            library_card(&raw, "tracks").unwrap(),
+            json!({
+                "kind":"track","ref":"track:1234567890123456789012","title":"Song",
+                "artist":"Artist","artist_ref":"artist:abcdefghijklmnopqrstuv",
+                "image":"cover","description":"","album":"Record",
+                "album_ref":"album:abcdefghijklmnopqrstuv",
+                "duration_ms":123000,"track_number":2,"disc_number":1,
+                "explicit":false,"available":true,"isrc":"TEST12345678",
+                "quality":{"codec":"vorbis"},"year":1998,"release_date":"1998",
+                "genres":["chamber pop"],"genre":"chamber pop","label":"Example Records",
+                "release_type":"single","added_at":1704164645
+            })
+        );
+    }
+
+    #[test]
+    fn saved_dates_accept_offsets_and_fractions_and_omit_invalid_values() {
+        for kind in ["albums", "tracks"] {
+            let singular = kind.trim_end_matches('s');
+            for (date, expected) in [
+                (json!("2024-01-02T03:04:05.987Z"), Some(1704164645_i64)),
+                (json!("2024-01-02T04:04:05+01:00"), Some(1704164645)),
+                (json!("1970-01-01T00:00:00Z"), Some(0)),
+                (json!("1969-12-31T23:59:59.500Z"), Some(-1)),
+                (json!("2024-02-30T03:04:05Z"), None),
+                (json!("2024-01-02"), None),
+                (json!("invalid"), None),
+                (json!(1704164645), None),
+                (Value::Null, None),
+            ] {
+                let raw = json!({"added_at":date,singular:{"id":"1234567890123456789012"}});
+                let item = library_card(&raw, kind).unwrap();
+                assert_eq!(item.get("added_at").and_then(Value::as_i64), expected);
+                if expected.is_none() {
+                    assert!(item.get("added_at").is_none());
+                }
+            }
+        }
+        let playlist = library_card(
+            &json!({"id":"1234567890123456789012","added_at":"2024-01-02T03:04:05Z"}),
+            "playlists",
+        )
+        .unwrap();
+        assert!(playlist.get("added_at").is_none());
+    }
+
+    #[test]
+    fn release_dates_keep_service_precision_and_release_types_are_explicit() {
+        for kind in ["albums", "tracks"] {
+            let singular = kind.trim_end_matches('s');
+            for date in ["1998", "1998-06", "1998-06-15"] {
+                for release_type in [
+                    "album",
+                    "single",
+                    "compilation",
+                    "ep",
+                    "live",
+                    "unknown",
+                    "",
+                ] {
+                    let record = json!({
+                        "id":"1234567890123456789012",
+                        "release_date":date,"album_type":release_type
+                    });
+                    let raw = if kind == "albums" {
+                        record
+                    } else {
+                        json!({"id":"1234567890123456789012","album":record})
+                    };
+                    let item = library_card(&json!({singular:raw}), kind).unwrap();
+                    assert_eq!(item["release_date"], date);
+                    assert_eq!(item["year"], 1998);
+                    if matches!(release_type, "album" | "single" | "compilation") {
+                        assert_eq!(item["release_type"], release_type);
+                    } else {
+                        assert!(item.get("release_type").is_none());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn absent_or_malformed_metadata_does_not_create_library_fields() {
+        for kind in ["albums", "tracks"] {
+            let singular = kind.trim_end_matches('s');
+            for raw_genres in [
+                Value::Null,
+                json!([]),
+                json!("rock"),
+                json!([null, 3, "", " ", "Music", "music"]),
+            ] {
+                let record = json!({
+                    "id":"1234567890123456789012","genres":raw_genres,
+                    "label":" ","album_type":null,"release_date":null
+                });
+                let raw = if kind == "albums" {
+                    record
+                } else {
+                    json!({"id":"1234567890123456789012","album":record})
+                };
+                let item = library_card(&json!({singular:raw}), kind).unwrap();
+                for key in [
+                    "genres",
+                    "genre",
+                    "label",
+                    "label_ref",
+                    "release_type",
+                    "year",
+                    "release_date",
+                    "added_at",
+                    "composers",
+                    "composer",
+                    "composer_ref",
+                    "work",
+                ] {
+                    assert!(item.get(key).is_none(), "{kind}: {key}");
+                }
+            }
+        }
+        let item = card(
+            &json!({
+                "id":"1234567890123456789012","genres":["art pop","art pop",null,"Music"],
+                "label":"Track Label",
+                "album":{"genres":["rock"],"label":"Record Label"}
+            }),
+            "track",
+        )
+        .unwrap();
+        assert_eq!(item["genres"], json!(["art pop"]));
+        assert_eq!(item["genre"], "art pop");
+        assert_eq!(item["label"], "Track Label");
+    }
+
+    fn saved_artist_item(kind: &str, index: usize) -> Value {
+        json!({
+            "added_at":"2024-01-02T03:04:05Z",
+            kind:{
+                "id":format!("{index:022}"),"name":format!("Item {index}"),
+                "artists":[{"id":format!("{index:022}"),"name":format!("Artist {index}")}]
+            }
+        })
+    }
+
+    fn artist_reply(start: usize, end: usize) -> String {
+        json!({"artists":(start..end).map(|i| json!({
+            "id":format!("{i:022}"),"genres":["art rock","rock"]
+        })).collect::<Vec<_>>()})
+        .to_string()
+    }
+
+    fn requested_artists(path: &str) -> Vec<String> {
+        let url = url::Url::parse(&format!("http://fixture{path}")).unwrap();
+        assert_eq!(url.path(), "/artists");
+        url.query_pairs()
+            .find(|(key, _)| key == "ids")
+            .unwrap()
+            .1
+            .split(',')
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn older_library_pages_are_rebuilt_from_cached_api_responses() {
+        let (client, _directory, worker) = crate::fixtures::client(vec![]).await;
+        let identity = client.identity().await.unwrap();
+        for kind in ["albums", "tracks"] {
+            let singular = kind.trim_end_matches('s');
+            let record = json!({
+                "id":"1234567890123456789012","release_date":"2001",
+                "genres":["ambient"],"label":"Example Records","album_type":"album"
+            });
+            let raw = if kind == "albums" {
+                record
+            } else {
+                json!({"id":"1234567890123456789012","album":record})
+            };
+            client
+                .snapshots
+                .put(
+                    &identity,
+                    &format!("library:{kind}:0:50"),
+                    json!({"items":[{"ref":"old-card"}],"total":1}),
+                )
+                .unwrap();
+            let query = [("limit", "50"), ("offset", "0")];
+            client
+                .snapshots
+                .put(
+                    &identity,
+                    &format!(
+                        "web:Primary:0:/me/{kind}:{}",
+                        serde_json::to_string(&query).unwrap()
+                    ),
+                    json!({
+                        "items":[{"added_at":"2024-01-02T03:04:05Z",singular:raw}],
+                        "total":1,"next":null
+                    }),
+                )
+                .unwrap();
+            let value = client.library(&json!({"kind":kind})).await.unwrap();
+            let item = &value["items"][0];
+            assert_eq!(item["ref"], format!("{singular}:1234567890123456789012"));
+            assert_eq!(item["added_at"], 1704164645_i64);
+            assert_eq!(item["label"], "Example Records");
+            assert_eq!(item["genres"], json!(["ambient"]));
+            assert_eq!(item["genre"], "ambient");
+            assert_eq!(item["release_type"], "album");
+            assert_eq!(item["release_date"], "2001");
+            assert_eq!(item["year"], 2001);
+        }
+        assert!(worker.join().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn library_genres_use_first_artists_and_share_album_and_track_cache() {
+        let mut album = saved_artist_item("album", 1);
+        album["album"]["artists"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id":format!("{:022}", 2),"name":"Guest"}));
+        let mut record_genres = saved_artist_item("album", 3);
+        record_genres["album"]["genres"] = json!(["chamber pop"]);
+        let mut track = saved_artist_item("track", 1);
+        track["track"]["album"] = json!({
+            "release_date":"2001-02-03","album_type":"album",
+            "artists":[{"id":format!("{:022}", 4),"name":"Record Artist"}]
+        });
+        let (client, _directory, worker) = crate::fixtures::routed(vec![
+            (
+                "/me/albums",
+                200,
+                json!({"items":[album.clone(),album,record_genres],"total":3,"next":null})
+                    .to_string(),
+            ),
+            ("/artists", 200, artist_reply(1, 2)),
+            (
+                "/me/tracks",
+                200,
+                json!({"items":[track],"total":1,"next":null}).to_string(),
+            ),
+        ])
+        .await;
+        let albums = client.library(&json!({"kind":"albums"})).await.unwrap();
+        assert_eq!(albums["items"][0]["genres"], json!(["art rock", "rock"]));
+        assert_eq!(albums["items"][1]["genre"], "art rock, rock");
+        assert_eq!(albums["items"][2]["genres"], json!(["chamber pop"]));
+        assert_eq!(albums["items"][0]["added_at"], 1704164645_i64);
+        let tracks = client.library(&json!({"kind":"tracks"})).await.unwrap();
+        assert_eq!(tracks["items"][0]["genres"], json!(["art rock", "rock"]));
+        assert_eq!(tracks["items"][0]["genre"], "art rock, rock");
+        assert_eq!(tracks["items"][0]["year"], 2001);
+        assert_eq!(tracks["items"][0]["release_type"], "album");
+        assert_eq!(tracks["items"][0]["added_at"], 1704164645_i64);
+        assert!(tracks["items"][0].get("label").is_none());
+        let paths = worker.join().unwrap();
+        assert_eq!(paths.len(), 3);
+        assert_eq!(requested_artists(&paths[1]), vec![format!("{:022}", 1)]);
+    }
+
+    #[tokio::test]
+    async fn artist_genres_obey_the_four_batch_budget_and_resume_from_cached_pages() {
+        let mut replies: Vec<_> =
+            (0..251)
+                .step_by(50)
+                .map(|offset| {
+                    (200, json!({
+                    "items":(offset..(offset+50).min(251))
+                        .map(|i| saved_artist_item("track", i)).collect::<Vec<_>>(),
+                    "total":251,"next":if offset < 250 { json!("ignored") } else { Value::Null }
+                }).to_string())
+                })
+                .collect();
+        for offset in (0..251).step_by(50) {
+            replies.push((200, artist_reply(offset, (offset + 50).min(251))));
+        }
+        let (client, directory, worker) = crate::fixtures::client(replies).await;
+        let params = json!({"kind":"tracks","limit":500});
+        let first = client.library(&params).await.unwrap();
+        let items = first["items"].as_array().unwrap();
+        assert_eq!(items.len(), 251);
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.get("genres").is_some())
+                .count(),
+            200
+        );
+        assert!(items[200].get("genre").is_none());
+        let second = client.library(&params).await.unwrap();
+        assert!(
+            array(&second["items"])
+                .iter()
+                .all(|item| item["genre"] == "art rock, rock")
+        );
+        let mut restarted = Client::new(
+            directory.path().join("data"),
+            directory.path().join("cache"),
+        )
+        .unwrap();
+        restarted.api_base = client.api_base.clone();
+        restarted.token_endpoint = client.token_endpoint.clone();
+        *restarted.account.lock().await = client.account.lock().await.clone();
+        assert_eq!(restarted.library(&params).await.unwrap(), second);
+        let paths = worker.join().unwrap();
+        assert_eq!(paths.len(), 12);
+        for (index, path) in paths[..6].iter().enumerate() {
+            assert!(path.starts_with("/me/tracks?"));
+            assert!(path.contains(&format!("offset={}", index * 50)));
+        }
+        for (index, path) in paths[6..].iter().enumerate() {
+            let ids = requested_artists(path);
+            assert_eq!(ids.len(), if index == 5 { 1 } else { 50 });
+            assert_eq!(ids[0], format!("{:022}", index * 50));
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_artist_genres_are_cached_for_thirty_days_and_isolated_by_account() {
+        let page = json!({"items":[saved_artist_item("album", 1)],"total":1,"next":null});
+        let (client, _directory, worker) = crate::fixtures::client(vec![
+            (200, page.to_string()),
+            (
+                200,
+                json!({"artists":[{"id":format!("{:022}", 1),"name":"Artist"}]}).to_string(),
+            ),
+            (200, artist_reply(1, 2)),
+            (200, page.to_string()),
+            (
+                200,
+                json!({"artists":[{"id":format!("{:022}", 1),"genres":[]}]}).to_string(),
+            ),
+        ])
+        .await;
+        let params = json!({"kind":"albums"});
+        let first = client.library(&params).await.unwrap();
+        assert!(first["items"][0].get("genres").is_none());
+        assert!(first["items"][0].get("genre").is_none());
+        let identity = client.identity().await.unwrap();
+        let id = format!("{:022}", 1);
+        let mut saved = client.snapshots.peek(&identity, ARTIST_GENRES_KEY).unwrap();
+        assert_eq!(saved[&id]["genres"], json!([]));
+        saved[&id]["at"] = json!(crate::state::now() - ARTIST_GENRES_TTL + 60);
+        client
+            .snapshots
+            .put(&identity, ARTIST_GENRES_KEY, saved.clone())
+            .unwrap();
+        assert_eq!(client.library(&params).await.unwrap(), first);
+        saved[&id]["at"] = json!(crate::state::now() - ARTIST_GENRES_TTL);
+        client
+            .snapshots
+            .put(&identity, ARTIST_GENRES_KEY, saved)
+            .unwrap();
+        let expired = client.library(&params).await.unwrap();
+        assert_eq!(expired["items"][0]["genre"], "art rock, rock");
+        client.account.lock().await.user = "another-account".into();
+        let other = client.library(&params).await.unwrap();
+        assert!(other["items"][0].get("genres").is_none());
+        assert_eq!(worker.join().unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn optional_artist_failures_leave_the_library_complete_and_retry_on_later_calls() {
+        for (status, body) in [(503, "{}"), (403, "{}"), (200, "{}"), (200, "invalid")] {
+            let (client, _directory, worker) = crate::fixtures::client(vec![
+                (
+                    200,
+                    json!({"items":[saved_artist_item("track", 1)],"total":1,"next":null})
+                        .to_string(),
+                ),
+                (status, body.into()),
+                (200, artist_reply(1, 2)),
+            ])
+            .await;
+            let params = json!({"kind":"tracks"});
+            let first = client.library(&params).await.unwrap();
+            assert_eq!(first["total"], 1);
+            assert_eq!(first["items"][0]["added_at"], 1704164645_i64);
+            assert!(first["items"][0].get("genres").is_none());
+            assert!(first.get("partial").is_none());
+            assert!(first.get("cached").is_none());
+            let retried = client.library(&params).await.unwrap();
+            assert_eq!(retried["items"][0]["genre"], "art rock, rock");
+            let paths = worker.join().unwrap();
+            assert_eq!(paths.len(), 3);
+            assert_eq!(requested_artists(&paths[1]), requested_artists(&paths[2]));
+        }
+    }
+
+    #[tokio::test]
+    async fn artist_quota_failure_keeps_library_rows_and_existing_fields() {
+        let (client, _directory, worker) = crate::fixtures::client(vec![
+            (
+                200,
+                json!({"items":[saved_artist_item("album", 1)],"total":1,"next":null}).to_string(),
+            ),
+            (429, "{}".into()),
+        ])
+        .await;
+        for _ in 0..2 {
+            let page = client.library(&json!({"kind":"albums"})).await.unwrap();
+            assert_eq!(page["total"], 1);
+            assert_eq!(page["items"][0]["added_at"], 1704164645_i64);
+            assert!(page["items"][0].get("genres").is_none());
+            assert!(page.get("cached").is_none());
+        }
+        assert_eq!(worker.join().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_library_calls_share_artist_batches_and_match_response_ids() {
+        let (client, _directory, worker) = crate::fixtures::client(vec![
+            (200, json!({"items":[saved_artist_item("album", 1),saved_artist_item("album", 2)],"total":2,"next":null}).to_string()),
+            (200, json!({"artists":[
+                {"id":format!("{:022}", 2),"genres":["chamber pop"]},
+                {"id":format!("{:022}", 9),"genres":["wrong artist"]},
+                {"id":format!("{:022}", 1),"genres":["art rock"]}
+            ]}).to_string()),
+        ])
+        .await;
+        let params = json!({"kind":"albums"});
+        let (a, b) = tokio::join!(client.library(&params), client.library(&params));
+        let a = a.unwrap();
+        assert_eq!(a, b.unwrap());
+        assert_eq!(a["items"][0]["genre"], "art rock");
+        assert_eq!(a["items"][1]["genre"], "chamber pop");
+        let paths = worker.join().unwrap();
+        assert_eq!(paths.len(), 2);
+        assert_eq!(
+            requested_artists(&paths[1]),
+            vec![format!("{:022}", 1), format!("{:022}", 2)]
+        );
+    }
+
     #[tokio::test]
     async fn independent_searches_keep_valid_results_when_one_category_fails() {
         let body = json!({"tracks":{"items":[{"id":"1234567890123456789012","name":"Track"}]},"albums":{"items":[]},"artists":{"items":[]},"playlists":{"items":[{"id":"1234567890123456789012","name":"List"}]}}).to_string();
