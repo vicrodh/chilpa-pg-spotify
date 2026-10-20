@@ -467,15 +467,6 @@ mod tests {
             metadata_client(vec![(200, reply([2]), Duration::ZERO)]).await;
         let identity = client.identity().await.unwrap();
         client.snapshots.put(&identity, "library:tracks:0:50:fields-v2", json!({"items":[{"ref":format!("track:{}",id(1)),"album_ref":format!("album:{}",id(2)),"genres":["ambient"]}]})).unwrap();
-        // Keep this integration fixture focused on the album request.
-        client
-            .snapshots
-            .put(
-                &identity,
-                "track-credits:v2",
-                json!({"tracks":{id(1):{"at":now(),"composers":[]}},"albums":{}}),
-            )
-            .unwrap();
         let page = client.library(&json!({"kind":"tracks"})).await.unwrap();
         assert_eq!(page["items"][0]["label"], "Example Records");
         assert_eq!(worker.join().unwrap().len(), 1);

@@ -12,6 +12,14 @@ pub enum WebSource {
     Primary,
     Shared,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RequestKind {
+    Standard,
+    Catalogue(u8),
+    Enrichment,
+}
+
 impl Client {
     async fn effective_source(&self, source: WebSource) -> WebSource {
         if self.account.lock().await.client_id == WEB_CLIENT {
@@ -153,7 +161,23 @@ impl Client {
         query: &[(&str, String)],
         body: Option<&Value>,
     ) -> Result<Value> {
-        self.request_for(source, method, path, query, body, 0).await
+        self.request_for(source, method, path, query, body, RequestKind::Standard)
+            .await
+    }
+    pub(crate) async fn enrichment_get(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<Value> {
+        self.request_for(
+            WebSource::Primary,
+            Method::GET,
+            path,
+            query,
+            None,
+            RequestKind::Enrichment,
+        )
+        .await
     }
     async fn request_for(
         &self,
@@ -162,7 +186,7 @@ impl Client {
         path: &str,
         query: &[(&str, String)],
         body: Option<&Value>,
-        catalogue: u8,
+        kind: RequestKind,
     ) -> Result<Value> {
         if !path.starts_with('/') || path.contains("..") || path.contains(['?', '#']) {
             bail!("Invalid Spotify API path.");
@@ -173,6 +197,10 @@ impl Client {
             &self.limits
         } else {
             &self.shared_limits
+        };
+        let catalogue = match kind {
+            RequestKind::Catalogue(catalogue) => catalogue,
+            _ => 0,
         };
         let probe = {
             let mut limits = limiter.lock().await;
@@ -238,7 +266,11 @@ impl Client {
                     .is_some_and(|v| {
                         v.pointer("/error/reason").and_then(Value::as_str) == Some("QUOTA_EXCEEDED")
                     });
-                limiter.lock().await.record(path, seconds, quota);
+                limiter.lock().await.record(
+                    path,
+                    seconds,
+                    quota || kind == RequestKind::Enrichment,
+                );
                 return Err(ApiFailure {
                     status,
                     wait: seconds,
@@ -326,7 +358,16 @@ impl Client {
                 3600
             },
             false,
-            || self.request_for(source, Method::GET, path, query, None, catalogue),
+            || {
+                self.request_for(
+                    source,
+                    Method::GET,
+                    path,
+                    query,
+                    None,
+                    RequestKind::Catalogue(catalogue),
+                )
+            },
         )
         .await
     }
@@ -343,6 +384,59 @@ pub fn error_data(error: &anyhow::Error) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn enrichment_429_only_pauses_its_route_and_survives_restart() {
+        for body in ["{}", "invalid", r#"{"error":{"reason":"QUOTA_EXCEEDED"}}"#] {
+            let (client, dir, worker) = crate::fixtures::client(vec![
+                (429, body.into()),
+                (200, "{}".into()),
+                (200, "{}".into()),
+                (200, "{}".into()),
+                (200, "{}".into()),
+            ])
+            .await;
+            let error = client.enrichment_get("/artists", &[]).await.unwrap_err();
+            assert_eq!(error_data(&error)["status"], 429);
+            assert_eq!(error_data(&error)["retry_after_ms"], 60000);
+            let routes = [
+                "/me/albums",
+                "/me/tracks",
+                "/albums/0000000000000000000001",
+                "/search",
+            ];
+            {
+                let limits = client.limits.lock().await;
+                let restarted =
+                    crate::limits::Limits::load(&dir.path().join("data/rate-limit.json"), "");
+                assert!((58..=60).contains(&limits.remaining("/artists")));
+                assert!((58..=60).contains(&restarted.remaining("/artists")));
+                for route in routes {
+                    assert_eq!(limits.remaining(route), 0);
+                    assert_eq!(restarted.remaining(route), 0);
+                }
+                assert_eq!(limits.remaining_search(false), 0);
+                assert_eq!(limits.remaining_search(true), 0);
+            }
+            assert!(client.enrichment_get("/artists", &[]).await.is_err());
+            for route in routes {
+                client.api(Method::GET, route, &[]).await.unwrap();
+            }
+            assert_eq!(
+                worker.join().unwrap(),
+                [vec!["/artists"], routes.to_vec()].concat()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_429_still_pauses_the_grant_including_enrichment() {
+        let (client, _dir, worker) = crate::fixtures::client(vec![(429, "{}".into())]).await;
+        assert!(client.api(Method::GET, "/me/tracks", &[]).await.is_err());
+        assert!(client.limits.lock().await.remaining("/me/albums") > 0);
+        assert!(client.enrichment_get("/artists", &[]).await.is_err());
+        assert_eq!(worker.join().unwrap(), vec!["/me/tracks"]);
+    }
+
     #[tokio::test]
     async fn concurrent_catalogue_recovery_uses_one_persisted_probe() {
         let (client, _dir, worker) = crate::fixtures::client(vec![(200, "{}".into())]).await;

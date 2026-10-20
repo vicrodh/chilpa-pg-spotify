@@ -4,12 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub(crate) const KEY: &str = "library-enrichment:v1";
-const FEATURES: [&str; 4] = [
-    "artist_genres",
-    "artist_genres_single",
-    "album_label",
-    "track_credits",
-];
+const FEATURES: [&str; 3] = ["artist_genres", "album_label", "track_credits"];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -39,17 +34,24 @@ pub(crate) enum TimeoutStage {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DisabledReason {
+    UnsupportedCreditsSchema,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "class", rename_all = "snake_case")]
 pub(crate) enum Outcome {
     Ok,
     CacheHit,
     NoCandidates,
-    NotAttempted,
     NoSession,
     NoToken,
     Disabled {
         #[serde(default)]
         remaining: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<DisabledReason>,
     },
     UnexpectedShape,
     Transport,
@@ -119,7 +121,10 @@ impl Client {
         }
         let remaining = entry.until.saturating_sub(now());
         (remaining > 0).then_some(if entry.status == 403 {
-            Outcome::Disabled { remaining }
+            Outcome::Disabled {
+                remaining,
+                reason: None,
+            }
         } else {
             Outcome::Http {
                 status: entry.status,
@@ -192,6 +197,10 @@ mod tests {
         for outcome in [
             Outcome::NoSession,
             Outcome::NoToken,
+            Outcome::Disabled {
+                remaining: 0,
+                reason: Some(DisabledReason::UnsupportedCreditsSchema),
+            },
             Outcome::Timeout {
                 stage: TimeoutStage::Identity,
             },
@@ -220,7 +229,11 @@ mod tests {
         genres.asked = 50;
         genres.with_data = 0;
         genres.outcome = Outcome::Http { status: 403 };
-        let mut previous = json!({"private-token":"private-name","artist_genres":genres});
+        let mut previous = json!({
+            "private-token":"private-name",
+            "artist_genres":genres,
+            "artist_genres_single":Attempt::start()
+        });
         previous["artist_genres"]["body"] = json!("private-name");
         store.put("first", KEY, previous).unwrap();
         let mut label = Attempt::start();
@@ -241,8 +254,16 @@ mod tests {
                 .is_none()
         );
         assert!(record(&store, "first", "private-name", Attempt::start()).is_err());
+        assert!(record(&store, "first", "artist_genres_single", Attempt::start()).is_err());
         let restarted = Store::new(directory.path().to_owned()).unwrap();
         assert_eq!(restarted.peek("first", KEY).unwrap(), saved);
+    }
+
+    #[test]
+    fn old_disabled_diagnostics_remain_readable_without_a_reason() {
+        let value = json!({"class":"disabled","remaining":3600});
+        let outcome = serde_json::from_value::<Outcome>(value.clone()).unwrap();
+        assert_eq!(json!(outcome), value);
     }
 
     #[test]

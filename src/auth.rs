@@ -111,7 +111,6 @@ pub struct Client {
     search_notice: Mutex<Option<String>>,
     pub(crate) snapshots: crate::snapshot::Store,
     pub(crate) library_reauth: AtomicBool,
-    pub(crate) credits_gate: Mutex<()>,
     pub(crate) labels_gate: Mutex<()>,
     pub(crate) enrichment_pauses:
         std::sync::Mutex<std::collections::HashMap<(String, String), crate::enrichment::Pause>>,
@@ -169,7 +168,6 @@ impl Client {
             search_notice: Mutex::new(None),
             snapshots,
             library_reauth: AtomicBool::new(false),
-            credits_gate: Mutex::new(()),
             labels_gate: Mutex::new(()),
             enrichment_pauses: std::sync::Mutex::new(Default::default()),
             metadata_gate: Mutex::new(()),

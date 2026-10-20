@@ -192,7 +192,7 @@ mod tests {
     use crate::{
         fixtures::{
             album_metadata, enrichment_diagnostic as diagnostic, id, metadata_client,
-            metadata_reply, track_metadata,
+            metadata_reply,
         },
         state::now,
     };
@@ -201,21 +201,8 @@ mod tests {
     use serde_json::{Value, json};
     use std::time::Duration;
 
-    fn page(kind: ExtensionKind) -> Value {
-        let entity = if kind == ExtensionKind::ALBUM_V4 {
-            "album"
-        } else {
-            "track"
-        };
-        json!({"items":(0..25).map(|i|json!({"ref":format!("{entity}:{}",id(i))})).collect::<Vec<_>>()})
-    }
-
-    async fn enrich(client: &Client, kind: ExtensionKind, page: &mut Value) {
-        if kind == ExtensionKind::ALBUM_V4 {
-            client.library_labels(page).await;
-        } else {
-            client.library_composers("tracks", page).await;
-        }
+    fn page() -> Value {
+        json!({"items":(0..25).map(|i|json!({"ref":format!("album:{}",id(i))})).collect::<Vec<_>>()})
     }
 
     #[test]
@@ -234,117 +221,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forbidden_transport_provider_and_rows_disable_both_extensions_for_an_hour() {
-        for kind in [ExtensionKind::ALBUM_V4, ExtensionKind::TRACK_V4] {
-            for level in ["http", "provider", "row"] {
-                let feature = if kind == ExtensionKind::ALBUM_V4 {
-                    "album_label"
-                } else {
-                    "track_credits"
-                };
-                let rows = metadata_reply(kind, (0..20).map(|i| (i, 403, vec![])).collect());
-                let (status, body) = match level {
-                    "http" => (403, b"private-response".to_vec()),
-                    "provider" => {
-                        let mut response =
-                            BatchedExtensionResponse::parse_from_bytes(&rows).unwrap();
-                        response.extended_metadata[0].header =
-                            MessageField::some(EntityExtensionDataArrayHeader {
-                                provider_error_status: 403,
-                                ..Default::default()
-                            });
-                        (200, response.write_to_bytes().unwrap())
-                    }
-                    _ => (200, rows),
-                };
-                let valid = |i| {
-                    if kind == ExtensionKind::ALBUM_V4 {
-                        album_metadata(i, "Label", &[])
-                    } else {
-                        track_metadata(i, &["Composer"])
-                    }
-                };
-                let success = metadata_reply(kind, (0..20).map(|i| (i, 200, valid(i))).collect());
-                let (client, directory, worker) = metadata_client(vec![
-                    (status, body, Duration::ZERO),
-                    (200, success.clone(), Duration::ZERO),
-                    (200, success, Duration::ZERO),
-                ])
-                .await;
-                let mut value = page(kind);
-                enrich(&client, kind, &mut value).await;
-                assert_eq!(
-                    diagnostic(&client, feature).await["outcome"],
-                    json!({"class":"http","status":403})
-                );
-                assert_eq!(diagnostic(&client, feature).await["asked"], 20);
-                let identity = client.identity().await.unwrap();
-                let cache = if kind == ExtensionKind::ALBUM_V4 {
-                    "album-label:v2"
-                } else {
-                    "track-credits:v2"
-                };
-                let entries = if kind == ExtensionKind::ALBUM_V4 {
-                    "albums"
-                } else {
-                    "tracks"
-                };
-                assert!(
-                    client.snapshots.peek(&identity, cache).unwrap()[entries]
-                        .as_object()
-                        .unwrap()
-                        .is_empty()
-                );
-                let pause_key = format!("capability:enrichment:{ROUTE}");
-                let until = client.snapshots.peek(&identity, &pause_key).unwrap()["until"]
-                    .as_u64()
-                    .unwrap();
-                assert!((3598..=3600).contains(&until.saturating_sub(now())));
-                let mut restarted = Client::new(
-                    directory.path().join("data"),
-                    directory.path().join("cache"),
-                )
+    async fn forbidden_transport_provider_and_rows_disable_labels_for_an_hour() {
+        let kind = ExtensionKind::ALBUM_V4;
+        for level in ["http", "provider", "row"] {
+            let rows = metadata_reply(kind, (0..20).map(|i| (i, 403, vec![])).collect());
+            let (status, body) = match level {
+                "http" => (403, b"private-response".to_vec()),
+                "provider" => {
+                    let mut response = BatchedExtensionResponse::parse_from_bytes(&rows).unwrap();
+                    response.extended_metadata[0].header =
+                        MessageField::some(EntityExtensionDataArrayHeader {
+                            provider_error_status: 403,
+                            ..Default::default()
+                        });
+                    (200, response.write_to_bytes().unwrap())
+                }
+                _ => (200, rows),
+            };
+            let success = metadata_reply(
+                kind,
+                (0..20)
+                    .map(|i| (i, 200, album_metadata(i, "Label", &[])))
+                    .collect(),
+            );
+            let (client, directory, worker) = metadata_client(vec![
+                (status, body, Duration::ZERO),
+                (200, success.clone(), Duration::ZERO),
+                (200, success, Duration::ZERO),
+            ])
+            .await;
+            client.library_labels(&mut page()).await;
+            let entry = diagnostic(&client, "album_label").await;
+            assert_eq!(entry["outcome"], json!({"class":"http","status":403}));
+            assert_eq!(entry["asked"], 20);
+            let identity = client.identity().await.unwrap();
+            assert!(
+                client.snapshots.peek(&identity, "album-label:v2").unwrap()["albums"]
+                    .as_object()
+                    .unwrap()
+                    .is_empty()
+            );
+            let pause_key = format!("capability:enrichment:{ROUTE}");
+            let until = client.snapshots.peek(&identity, &pause_key).unwrap()["until"]
+                .as_u64()
                 .unwrap();
-                *restarted.account.lock().await = client.account.lock().await.clone();
-                restarted.metadata_fixture = client.metadata_fixture.clone();
-                enrich(&restarted, kind, &mut value).await;
-                let paused = diagnostic(&restarted, feature).await;
-                assert_eq!(paused["asked"], 0);
-                assert_eq!(paused["outcome"]["class"], "disabled");
-                assert!((3598..=3600).contains(&paused["outcome"]["remaining"].as_u64().unwrap()));
-                let other = if kind == ExtensionKind::ALBUM_V4 {
-                    ExtensionKind::TRACK_V4
-                } else {
-                    ExtensionKind::ALBUM_V4
-                };
-                enrich(&restarted, other, &mut page(other)).await;
-                let other_feature = if other == ExtensionKind::ALBUM_V4 {
-                    "album_label"
-                } else {
-                    "track_credits"
-                };
-                assert_eq!(
-                    diagnostic(&restarted, other_feature).await["outcome"]["class"],
-                    "disabled"
-                );
-                restarted.account.lock().await.user = "other-account".into();
-                enrich(&restarted, kind, &mut page(kind)).await;
-                assert_eq!(diagnostic(&restarted, feature).await["with_data"], 20);
-                restarted.account.lock().await.user = "test".into();
-                restarted.enrichment_pauses.lock().unwrap().clear();
-                restarted
-                    .snapshots
-                    .put(&identity, &pause_key, json!({"until":now(),"status":403}))
-                    .unwrap();
-                // Reset the continuation so this fixture can assert the same response identities.
-                restarted
-                    .snapshots
-                    .put(&identity, cache, json!({"albums":{},"tracks":{}}))
-                    .unwrap();
-                enrich(&restarted, kind, &mut page(kind)).await;
-                assert_eq!(diagnostic(&restarted, feature).await["with_data"], 20);
-                assert_eq!(worker.join().unwrap().len(), 3);
-            }
+            assert!((3598..=3600).contains(&until.saturating_sub(now())));
+            let mut restarted = Client::new(
+                directory.path().join("data"),
+                directory.path().join("cache"),
+            )
+            .unwrap();
+            *restarted.account.lock().await = client.account.lock().await.clone();
+            restarted.metadata_fixture = client.metadata_fixture.clone();
+            restarted.library_labels(&mut page()).await;
+            let paused = diagnostic(&restarted, "album_label").await;
+            assert_eq!(paused["asked"], 0);
+            assert_eq!(paused["outcome"]["class"], "disabled");
+            assert!((3598..=3600).contains(&paused["outcome"]["remaining"].as_u64().unwrap()));
+            restarted.account.lock().await.user = "other-account".into();
+            restarted.library_labels(&mut page()).await;
+            assert_eq!(diagnostic(&restarted, "album_label").await["with_data"], 20);
+            restarted.account.lock().await.user = "test".into();
+            restarted.enrichment_pauses.lock().unwrap().clear();
+            restarted
+                .snapshots
+                .put(&identity, &pause_key, json!({"until":now(),"status":403}))
+                .unwrap();
+            restarted
+                .snapshots
+                .put(&identity, "album-label:v2", json!({"albums":{}}))
+                .unwrap();
+            restarted.library_labels(&mut page()).await;
+            assert_eq!(diagnostic(&restarted, "album_label").await["with_data"], 20);
+            assert_eq!(worker.join().unwrap().len(), 3);
         }
     }
 
@@ -355,16 +304,13 @@ mod tests {
         let path = directory.path().join("cache/snapshots");
         std::fs::remove_dir(&path).unwrap();
         std::fs::write(&path, "blocked writes").unwrap();
-        client
-            .library_labels(&mut page(ExtensionKind::ALBUM_V4))
-            .await;
-        client
-            .library_labels(&mut page(ExtensionKind::ALBUM_V4))
-            .await;
+        client.library_labels(&mut page()).await;
+        client.library_labels(&mut page()).await;
         assert!(matches!(
             client.enrichment_pause(&client.identity().await.unwrap(), ROUTE),
             Some(Outcome::Disabled {
-                remaining: 1..=3600
+                remaining: 1..=3600,
+                ..
             })
         ));
         std::fs::remove_file(&path).unwrap();
@@ -378,7 +324,7 @@ mod tests {
                 json!({"albums":{id(0):{"at":now(),"label":"Cached","source":"metadata"}}}),
             )
             .unwrap();
-        let mut value = page(ExtensionKind::ALBUM_V4);
+        let mut value = page();
         client.library_labels(&mut value).await;
         assert_eq!(value["items"][0]["label"], "Cached");
         assert_eq!(diagnostic(&client, "album_label").await["cached"], 1);
@@ -390,16 +336,13 @@ mod tests {
         for status in [200, 429] {
             let (client, _directory, worker) =
                 metadata_client(vec![(status, b"invalid protobuf".to_vec(), Duration::ZERO)]).await;
-            client
-                .library_composers("tracks", &mut page(ExtensionKind::TRACK_V4))
-                .await;
-            let outcome = diagnostic(&client, "track_credits").await["outcome"].clone();
+            client.library_labels(&mut page()).await;
+            let outcome = diagnostic(&client, "album_label").await["outcome"].clone();
             if status == 429 {
                 assert_eq!(outcome, json!({"class":"http","status":429}));
-                client
-                    .library_composers("tracks", &mut page(ExtensionKind::TRACK_V4))
-                    .await;
-                assert_eq!(diagnostic(&client, "track_credits").await["asked"], 0);
+                client.library_labels(&mut page()).await;
+                assert_eq!(diagnostic(&client, "album_label").await["asked"], 0);
+                assert_eq!(client.limits.lock().await.remaining("/me/albums"), 0);
             } else {
                 assert_eq!(outcome, json!({"class":"unexpected_shape"}));
             }
@@ -408,39 +351,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_label_and_credit_refusals_make_only_one_request() {
+    async fn disabled_credits_do_not_interfere_with_label_requests() {
         let (client, _directory, worker) =
             metadata_client(vec![(403, vec![], Duration::from_millis(30))]).await;
-        let mut albums = page(ExtensionKind::ALBUM_V4);
-        let mut tracks = page(ExtensionKind::TRACK_V4);
+        let mut albums = page();
+        let mut tracks = json!({"items":[{"ref":format!("track:{}",id(0))}]});
         tokio::join!(
             client.library_labels(&mut albums),
             client.library_composers("tracks", &mut tracks)
         );
         let label = diagnostic(&client, "album_label").await;
         let credit = diagnostic(&client, "track_credits").await;
-        let classes = [
-            label["outcome"]["class"].as_str().unwrap(),
-            credit["outcome"]["class"].as_str().unwrap(),
-        ];
-        assert!(classes.contains(&"http"));
-        assert!(classes.contains(&"disabled"));
-        assert_eq!(
-            label["asked"].as_u64().unwrap() + credit["asked"].as_u64().unwrap(),
-            20
-        );
+        assert_eq!(label["outcome"], json!({"class":"http","status":403}));
+        assert_eq!(label["asked"], 20);
+        assert_eq!(credit["outcome"]["class"], "disabled");
+        assert_eq!(credit["outcome"]["reason"], "unsupported_credits_schema");
+        assert_eq!(credit["asked"], 0);
         assert_eq!(worker.join().unwrap().len(), 1);
     }
 
     #[test]
     fn envelope_validation_rejects_missing_duplicate_wrong_kind_and_wrong_uri_rows() {
-        let kind = ExtensionKind::TRACK_V4;
-        let uris = [format!("spotify:track:{}", id(1))];
-        let response = metadata_reply(kind, vec![(1, 200, track_metadata(1, &[]))]);
+        let kind = ExtensionKind::ALBUM_V4;
+        let uris = [format!("spotify:album:{}", id(1))];
+        let response = metadata_reply(kind, vec![(1, 200, album_metadata(1, "Label", &[]))]);
         let response = BatchedExtensionResponse::parse_from_bytes(&response).unwrap();
         assert!(answers(&uris, kind, response.clone()).unwrap()[&uris[0]].is_ok());
         let mut wrong = response.clone();
-        wrong.extended_metadata[0].extension_kind = EnumOrUnknown::new(ExtensionKind::ALBUM_V4);
+        wrong.extended_metadata[0].extension_kind = EnumOrUnknown::new(ExtensionKind::TRACK_V4);
         assert_eq!(
             answers(&uris, kind, wrong).unwrap()[&uris[0]],
             Err(Outcome::UnexpectedShape)

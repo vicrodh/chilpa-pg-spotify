@@ -122,28 +122,6 @@ pub fn album_metadata(index: usize, label: &str, lines: &[(&str, bool)]) -> Vec<
     album.write_to_bytes().unwrap()
 }
 
-pub fn track_metadata(index: usize, names: &[&str]) -> Vec<u8> {
-    use librespot_protocol::metadata::{ArtistWithRole, Track, artist_with_role::ArtistRole};
-    use protobuf::Message;
-    let mut track = Track::new();
-    track.set_gid(
-        librespot_core::SpotifyId::from_base62(&id(index))
-            .unwrap()
-            .to_raw()
-            .to_vec(),
-    );
-    track.artist_with_role = names
-        .iter()
-        .map(|name| {
-            let mut artist = ArtistWithRole::new();
-            artist.set_artist_name((*name).into());
-            artist.set_role(ArtistRole::ARTIST_ROLE_COMPOSER);
-            artist
-        })
-        .collect();
-    track.write_to_bytes().unwrap()
-}
-
 pub fn metadata_reply(
     kind: librespot_protocol::extension_kind::ExtensionKind,
     rows: Vec<(usize, u16, Vec<u8>)>,

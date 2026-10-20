@@ -1,5 +1,5 @@
 // Spotify does not publish bucket membership. I pause only the observed route
-// family for QUOTA_EXCEEDED; an ordinary rolling rate limit pauses the grant.
+// family for enrichment and QUOTA_EXCEEDED; other rolling limits pause the grant.
 use crate::state::{now, save_json};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -144,14 +144,14 @@ impl Limits {
         }
         self.persist()
     }
-    pub fn record(&mut self, route: &str, seconds: u64, quota: bool) {
+    pub fn record(&mut self, route: &str, seconds: u64, route_only: bool) {
         let deadline = now().saturating_add(seconds.max(1));
         if family(route) == "search" {
             self.catalogue_verified = false;
             self.playlist_verified = false;
         }
         self.routes.retain(|_, until| *until > now());
-        if quota {
+        if route_only {
             let until = self.routes.entry(family(route)).or_default();
             *until = (*until).max(deadline);
         } else {

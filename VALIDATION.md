@@ -1,5 +1,142 @@
 # Validation
 
+## Library enrichment 0.3.5 (phase 5)
+
+This phase uses repository source and loopback fixtures only. The owner supplied
+counts and outcome classes from 0.3.4: batch genres were paused after 403,
+single-artist genres returned 429, labels returned data for 3/3 albums, and
+`TRACK_V4` returned composers for 0/20 tracks. No live service calls, private
+plugin data/cache, owner account files, tokens or environment files were read.
+
+### Genres and Web API limits
+
+`src/catalog.rs:455` keeps the batch artist request behind its existing
+account-scoped, persisted one-hour 403 pause. The single-artist fallback is
+removed, including during that pause and after batch 404. The batch path is
+retained because one client's refusal does not establish failure for every
+client; it still supports successful responses without probing individuals.
+It keeps the four-batch/50-artist/six-second budget and 30-day cache. Missing
+fields remain failures rather than negative cache entries.
+
+`src/catalog.rs:486` uses `enrichment_get`, defined in `src/web_api.rs:167`.
+The request carries an explicit enrichment kind. Its 429 records the observed
+Retry-After on only the requested route family, regardless of whether the body
+contains `QUOTA_EXCEEDED`, is empty, or is malformed. `src/limits.rs:147`
+retains the existing route-family persistence. Ordinary rolling 429s still set
+the global deadline; enrichment still honors those existing global deadlines.
+No old global deadline is cleared because it has no request provenance.
+
+`src/web_api.rs:388` tests the actual HTTP 429 path, persistence/reload, no
+second artist request during Retry-After, zero remaining time for `/me/albums`,
+`/me/tracks`, `/albums/{id}` and search, and successful HTTP requests on all four
+routes afterward. `src/catalog.rs:1666` also checks isolation through the actual
+library-enrichment caller. `src/web_api.rs:432` preserves the ordinary global
+429 behavior. Tests at `src/catalog.rs:1458` and `:1493` cover absence of the
+fallback, 403 pause persistence, expiry and account isolation.
+
+### Credits: protocol evidence and limit of the conclusion
+
+`vendor/librespot/core/src/spclient.rs:628` selects `TRACK_V4` for track metadata;
+`vendor/librespot/metadata/src/track.rs:59` decodes that response as
+`metadata::Track`. `vendor/librespot/protocol/proto/metadata.proto:94` defines
+repeated `artist_with_role`; line 106 allows `ARTIST_ROLE_COMPOSER = 5`.
+Consequently composer roles are possible in that schema. Static source does
+not establish that ordinary tracks populate them, and the supplied 0/20 result
+does not prove they are absent from every track. This is artist-role metadata,
+not a comprehensive writers/contributors contract.
+
+The same vendor names `TRACK_EXTENDED_CREDITS = 96`, `CREDITS_TRAIT = 131`, and
+`CREDITS_V2_TRAIT = 186` in `extension_kind.proto:110`, `:144`, and `:199`.
+A static search of all vendored protocol, metadata and core source found those
+enum declarations but no corresponding payload messages or decoders.
+`entity_extension_data.proto:25` wraps extension payloads in `google.protobuf.Any`;
+the extension ID alone does not specify the payload's fields or role semantics.
+There is therefore no implementable dedicated credits contract in this vendor.
+This is not a claim that Spotify has no credits extension. No wire schema or
+new endpoint is guessed, and no switch to an unverified extension is claimed.
+
+`src/session_credits.rs:210` disables credits acquisition with the fixed reason
+`unsupported_credits_schema`. No enrichment `TRACK_V4` requests remain. Normal
+track metadata for playback/catalog navigation is unchanged. Existing fresh
+composer answers still project onto tracks and albums with known membership;
+found answers expire after 90 days and empty answers after seven days. The old
+credits cache is read only and no new negative answers are written. The test at
+`src/session_credits.rs:242` checks zero requests, repeated calls, restart and
+absence of new credit cache entries. Further tests cover account isolation,
+expiry, album membership, deduplication and diagnostic write failure. Label
+requests retain their bounded session transport and existing cache behavior.
+
+### Diagnostics and release
+
+`src/enrichment.rs:7` now allowlists exactly `artist_genres`, `album_label`, and
+`track_credits`. Its merge at line 160 drops the obsolete `artist_genres_single`
+entry on the next write. Counts and first-failure handling are unchanged.
+Genre refusal records `{"class":"http","status":403}`; skipped calls during
+the hour record `{"class":"disabled","remaining":<seconds>}`. A genre 429
+records `{"class":"http","status":429}` and the route-local limiter persists
+its Retry-After. Credits record:
+
+```json
+{"outcome":{"class":"disabled","remaining":0,"reason":"unsupported_credits_schema"},"asked":0,"with_data":0,"cached":0}
+```
+
+The stored entry also contains `at`; `cached` reflects the actual number of
+fresh cached answers, including empty answers. `remaining: 0` for credits is
+not a retry deadline: the reason identifies a disabled implementation.
+Reasons are an enum, not response text. Old disabled diagnostics without a
+reason remain readable. No names, IDs, tokens or response bodies enter these
+records.
+
+The manifest, Cargo package and lockfile are version 0.3.5. Manifest network
+permissions, dependencies, vendor files, SDK pins and process/API contracts are
+unchanged. No live installation or host load is performed in this phase.
+
+### Final checks and package
+
+The required checks ran in order with Cargo offline through the shared lock and
+capped wrapper, one command at a time:
+
+```text
+Verified 666 vendored source files.
+Finished `test` profile [unoptimized + debuginfo] target(s) in 16.07s
+test result: ok. 105 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.10s
+```
+
+The command was
+`python3 tools/verify-vendor` followed by
+`CARGO_NET_OFFLINE=true flock /mnt/build/tmp/blitzkriegfc/chilpa-cargo.lock $HOME/.local/bin/cargo-capped cargo test --locked --bin plugin`.
+The ignored test requires explicit live-account access and was not run.
+
+`CARGO_NET_OFFLINE=true python3 tools/build-native` built and packaged the
+release. The script itself invokes Cargo through the shared lock and capped
+wrapper; no outer lock was added. It applies the same compiler path remapping
+as phase 4. The packaged executable then passed the protocol suite in fresh
+temporary profiles:
+
+```text
+Finished `release` profile [optimized] target(s) in 25.25s
+ZIP verification passed: 10 entries, CRC, sidecar, version, unchanged permissions, executable mode, packaged files and binary.
+Ran 10 tests in 0.300s
+OK
+```
+
+Package: `dist/app.chilpa.spotify-0.3.5-linux-x86_64.zip`.
+SHA-256:
+
+```text
+2f607513eabc35a2e3f87ca2b8a17c64a99eb13abb624a0c8ed16e00cf59dc42
+```
+
+The ZIP has the matching SHA-256 sidecar. Its executable matches the release
+build and contains no owner home-directory build path. Packaged manifest,
+README, lockfile, source pins, icon, license, attribution and dependency source
+archive match the repository; aggregated third-party licenses match the inputs.
+The existing vendored lint-expectation warning and four release unused-import/
+helper warnings remain. No live-service, installation, live-account or host-load
+validation was performed. Live genre availability and credits-extension payloads
+remain unverified; the tests establish local request isolation and disabled
+credits behavior.
+
 ## Library enrichment 0.3.4 (phase 4)
 
 Validated on 2026-10-20 using repository source, inline protobuf fixtures and
