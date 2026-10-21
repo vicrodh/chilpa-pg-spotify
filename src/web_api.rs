@@ -226,6 +226,8 @@ impl Client {
                     .query(query);
                 if let Some(body) = body {
                     request = request.json(body);
+                } else if matches!(method, Method::PUT | Method::POST | Method::DELETE) {
+                    request = request.header(reqwest::header::CONTENT_LENGTH, "0");
                 }
                 request.send()
             };
@@ -384,6 +386,96 @@ pub fn error_data(error: &anyhow::Error) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn favorites_send_an_explicit_empty_length_and_keep_json_writes_intact() {
+        use tiny_http::{Response, Server, StatusCode};
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let address = format!("http://{}", server.server_addr());
+        let worker = std::thread::spawn(move || {
+            for kind in ["track", "album", "artist", "playlist"] {
+                for method in ["PUT", "DELETE"] {
+                    let mut request = server
+                        .recv_timeout(std::time::Duration::from_secs(3))
+                        .unwrap()
+                        .expect("expected favorite write");
+                    let length = request
+                        .headers()
+                        .iter()
+                        .find(|h| h.field.equiv("Content-Length"))
+                        .map(|h| h.value.as_str());
+                    let valid = length == Some("0");
+                    assert_eq!(request.method().as_str(), method);
+                    let url = url::Url::parse(&format!("http://fixture{}", request.url())).unwrap();
+                    assert_eq!(url.path(), "/me/library");
+                    assert_eq!(
+                        url.query_pairs().find(|(key, _)| key == "uris").unwrap().1,
+                        format!("spotify:{kind}:1234567890123456789012")
+                    );
+                    let mut body = String::new();
+                    request.as_reader().read_to_string(&mut body).unwrap();
+                    assert!(body.is_empty());
+                    request
+                        .respond(Response::empty(StatusCode(if valid { 204 } else { 411 })))
+                        .unwrap();
+                }
+            }
+            let mut request = server
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap()
+                .expect("expected JSON write");
+            let length = request
+                .headers()
+                .iter()
+                .find(|h| h.field.equiv("Content-Length"))
+                .unwrap()
+                .value
+                .as_str()
+                .parse::<usize>()
+                .unwrap();
+            let mut body = String::new();
+            request.as_reader().read_to_string(&mut body).unwrap();
+            assert_eq!(length, body.len());
+            assert_eq!(
+                serde_json::from_str::<Value>(&body).unwrap(),
+                json!({"name":"Saved"})
+            );
+            request.respond(Response::from_string("{}")).unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut client = Client::new(
+            directory.path().join("data"),
+            directory.path().join("cache"),
+        )
+        .unwrap();
+        client.api_base = address;
+        *client.account.lock().await = Account {
+            user: "test".into(),
+            access_token: "test-only".into(),
+            refresh_token: "test-only".into(),
+            expires: u64::MAX,
+            ..Default::default()
+        };
+        for kind in ["track", "album", "artist", "playlist"] {
+            for on in [true, false] {
+                client
+                    .favorite(&json!({"ref":format!("{kind}:1234567890123456789012"),"on":on}))
+                    .await
+                    .unwrap();
+            }
+        }
+        client
+            .api_for(
+                WebSource::Primary,
+                Method::POST,
+                "/me/playlists",
+                &[],
+                Some(&json!({"name":"Saved"})),
+            )
+            .await
+            .unwrap();
+        worker.join().unwrap();
+    }
+
     #[tokio::test]
     async fn enrichment_429_only_pauses_its_route_and_survives_restart() {
         for body in ["{}", "invalid", r#"{"error":{"reason":"QUOTA_EXCEEDED"}}"#] {
