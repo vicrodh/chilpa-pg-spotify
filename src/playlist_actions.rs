@@ -20,6 +20,9 @@ impl Client {
 
     pub async fn page_action(&self, params: &Value) -> Result<Value> {
         let action = text(params, "action");
+        if ["playlist.update", "playlist.delete"].contains(&action) {
+            return self.change_playlist(action, params).await;
+        }
         if !["playlist.create", "playlist.add"].contains(&action) {
             return self.favorite(params).await;
         }
@@ -136,6 +139,52 @@ impl Client {
     }
 }
 
+impl Client {
+    /// Renames a playlist the account owns, or takes it from the library.
+    /// Spotify has no delete: its own apps remove the playlist from the
+    /// library, and so does this, as a heart turned off does.
+    async fn change_playlist(&self, action: &str, params: &Value) -> Result<Value> {
+        ensure!(
+            self.can_edit_playlists().await,
+            "Enable playlist writing in the plugin settings to grant playlist permissions."
+        );
+        let (_, id) = reference(text(params, "ref"), Some("playlist"))?;
+        let body = (action == "playlist.update").then(|| create_body(params)).transpose()?;
+        let metadata = self
+            .get_for(WebSource::Primary, &format!("/playlists/{id}"), &[])
+            .await?;
+        ensure!(
+            self.playlist_editable(&metadata).await,
+            "This account does not own this playlist."
+        );
+        match body {
+            Some(body) => {
+                self.api_for(WebSource::Primary, Method::PUT, &format!("/playlists/{id}"), &[], Some(&body))
+                    .await?;
+            }
+            None => {
+                self.api(Method::DELETE, "/me/library", &[("uris", format!("spotify:playlist:{id}"))])
+                    .await?;
+            }
+        }
+        let identity = self.identity().await?;
+        for prefix in [
+            "library:".to_owned(),
+            "library-head-probe:".to_owned(),
+            "web:".to_owned(),
+            "session:rootlist".to_owned(),
+            "discover:".to_owned(),
+            format!("session:playlist:{id}:"),
+            format!("session:v2:playlist:{id}:"),
+            format!("session:v2:entity:playlist:{id}"),
+            format!("session:playlist-header:{id}"),
+        ] {
+            self.snapshots.invalidate(&identity, &prefix);
+        }
+        Ok(json!({"changed_refs":[params["ref"],"section:playlists"]}))
+    }
+}
+
 fn writable(metadata: &Value, user: &str) -> bool {
     !user.is_empty() && metadata["owner"]["id"].as_str() == Some(user)
 }
@@ -235,6 +284,40 @@ mod tests {
             worker.join().unwrap(),
             ["/playlists/1234567890123456789012"]
         );
+    }
+    #[tokio::test]
+    async fn an_owned_playlist_is_renamed_and_taken_from_the_library() {
+        let owned = || (200, json!({"owner":{"id":"test"}}).to_string());
+        let (client, _directory, worker) = crate::fixtures::client(vec![owned(), (200, String::new())]).await;
+        client.account.lock().await.scopes = vec!["playlist-modify-private".into(), "playlist-modify-public".into()];
+        let reply = client
+            .page_action(&json!({"action":"playlist.update","ref":"playlist:1234567890123456789012","title":" Road ","description":"Long","public":true}))
+            .await
+            .unwrap();
+        assert_eq!(reply["changed_refs"], json!(["playlist:1234567890123456789012", "section:playlists"]));
+        assert_eq!(worker.join().unwrap(), ["/playlists/1234567890123456789012", "/playlists/1234567890123456789012"]);
+        let (client, _directory, worker) = crate::fixtures::client(vec![owned(), (200, String::new())]).await;
+        client.account.lock().await.scopes = vec!["playlist-modify-private".into(), "playlist-modify-public".into()];
+        client
+            .page_action(&json!({"action":"playlist.delete","ref":"playlist:1234567890123456789012"}))
+            .await
+            .unwrap();
+        let paths = worker.join().unwrap();
+        assert_eq!(paths[0], "/playlists/1234567890123456789012");
+        assert!(paths[1].starts_with("/me/library") && paths[1].contains("spotify%3Aplaylist%3A1234567890123456789012"), "{paths:?}");
+    }
+    #[tokio::test]
+    async fn someone_else_s_playlist_is_neither_renamed_nor_deleted() {
+        for action in ["playlist.update", "playlist.delete"] {
+            let (client, _directory, worker) = crate::fixtures::client(vec![(200, json!({"owner":{"id":"other"}}).to_string())]).await;
+            client.account.lock().await.scopes = vec!["playlist-modify-private".into(), "playlist-modify-public".into()];
+            assert!(client.page_action(&json!({"action":action,"ref":"playlist:1234567890123456789012","title":"Mix"})).await.is_err());
+            assert_eq!(worker.join().unwrap(), ["/playlists/1234567890123456789012"], "{action} reads, never writes");
+        }
+        let (client, _directory, worker) = crate::fixtures::client(vec![]).await;
+        client.account.lock().await.scopes = vec!["playlist-modify-private".into(), "playlist-modify-public".into()];
+        assert!(client.page_action(&json!({"action":"playlist.update","ref":"playlist:1234567890123456789012","title":"  "})).await.is_err());
+        assert!(worker.join().unwrap().is_empty(), "a name left empty is refused before asking");
     }
     #[tokio::test]
     async fn an_ambiguous_create_is_never_replayed_with_the_same_request_id() {

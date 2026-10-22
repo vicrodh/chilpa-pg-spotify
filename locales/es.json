@@ -123,6 +123,7 @@
   "Enable shared search with the same account as the library.": "Autoriza la búsqueda compartida con la misma cuenta de la biblioteca.",
   "Enable playlist writing in the plugin settings to grant playlist permissions.": "Activa la escritura de playlists en los ajustes del plugin para conceder los permisos necesarios.",
   "This account does not have permission to add tracks to this playlist.": "Esta cuenta no tiene permiso para añadir canciones a esta playlist.",
+  "This account does not own this playlist.": "Esta playlist no es de esta cuenta.",
   "This playlist request already completed. Open your library before adding more tracks.": "Esta solicitud de playlist ya se completó. Abre tu biblioteca antes de añadir más canciones.",
   "The previous playlist request may have completed. Open the playlist before trying a new request.": "La solicitud anterior pudo haberse completado. Abre la playlist antes de intentar una solicitud nueva.",
   "Tracks may have been added, but the confirmation was incomplete. Open the playlist before retrying.": "Es posible que se hayan añadido las canciones, pero la confirmación quedó incompleta. Abre la playlist antes de reintentar.",
