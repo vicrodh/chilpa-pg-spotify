@@ -1,5 +1,8 @@
 # Spotify for Chilpa
 
+This update targets **Chilpa 0.1.3** and its matching plugin contracts.
+Release and catalog publication are pending that host release.
+
 Spotify search, library, discovery and playback through Chilpa's native process
 plugin API. All provider code and account handling live in this repository;
 no changes to Chilpa core, UI or SDK are required.
@@ -15,6 +18,11 @@ The SDK includes it as a [native source example](https://github.com/vicrodh/chil
 - Browse albums, artist releases, popular tracks, playlists and saved library items.
 - Album cards include a digit-only UPC string when supplied by the Web API or playback metadata.
 - Discover personalized Home when available, editorial playlists and new releases.
+- Discover artists and recent releases inside Chilpa's Genres pages on hosts with
+  `genre_discovery: 1` support. Artists use Spotify's genre filter; releases come
+  from matching tracks' albums dated within the last 90 days, newest first.
+  This is a bounded selection, not an exhaustive release calendar. Genres that
+  Spotify does not recognise can return no results. Library authorisation is required.
 - Radio from album and artist pages, with a stable mix until explicitly refreshed.
 - Create playlists and add ordered tracks through Chilpa's playlist picker.
 - Source lyrics with timing, language and provider attribution when available.
@@ -95,6 +103,12 @@ Native workers have direct networking; the manifest domain list is not an
 outbound firewall for librespot's regional access points and audio CDNs.
 
 ## Limits
+
+- Genre discovery runs only on request: at most six search calls, ten results per
+  call, 24 seconds total and 20 cards per shelf. Snapshots reuse the existing
+  account-scoped bounded cache for 20 minutes. Refresh rechecks the API after
+  the existing one-minute coalescing window; transient failures retain a usable
+  previous snapshot. No background polling is added.
 
 - Library enrichment is optional. Labels use session `ALBUM_V4` metadata for
   albums and tracks' albums. The protobuf label takes precedence; otherwise the
@@ -201,3 +215,16 @@ This is an unofficial client with no affiliation to Spotify or Spotifast.
 Spotify is a trademark of Spotify AB. The open-source licenses are separate
 from Spotify's [Developer Terms](https://developer.spotify.com/terms) and
 [Web API documentation](https://developer.spotify.com/documentation/web-api).
+
+## Pull request packages
+
+GitHub Actions runs tests and packages this branch on pull requests and pushes
+to main. Download the ZIP, SHA-256 and archive-check report from the successful
+run's artifacts. These are test artifacts retained for 30 days, not releases;
+the workflow does not publish a release or update a plugin catalog.
+
+CI checks do not replace installation of the exact ZIP in a compatible native
+and Flatpak host. A build does not establish live account playback or physical
+audio output. Release validation remains separate.
+
+CI packages Linux x86_64 on Debian 12 and macOS Apple Silicon.

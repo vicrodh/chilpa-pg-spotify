@@ -5,6 +5,7 @@ mod discover;
 mod enrichment;
 #[cfg(test)]
 mod fixtures;
+mod genre_discovery;
 mod i18n;
 mod limits;
 mod lyrics;
@@ -98,9 +99,38 @@ impl Service {
 }
 
 fn capabilities() -> Value {
-    json!({"protocol":1,"capabilities":{"auth":"browser","search":true,"pages":true,"home":true,
+    json!({"protocol":1,"capabilities":{"auth":"browser","search":true,"pages":true,"genre_discovery":1,"home":true,
         "resolve":true,"favorites":true,"library":["albums","tracks","artists","playlists"],
         "playlist_edit":true,"folder_edit":false,"scene_search_limit":5,"track_lyrics":1}})
+}
+
+/// A writable folder the host names: `key` in `initialize`, else the
+/// environment's `variable`. A missing or relative folder is an error; no
+/// default is substituted.
+fn folder(params: &Value, key: &str, variable: &str) -> Result<PathBuf> {
+    let named = match params.get(key) {
+        None | Some(Value::Null) => std::env::var_os(variable).map(PathBuf::from),
+        Some(found) => found.as_str().map(PathBuf::from),
+    };
+    named.filter(|path| path.is_absolute()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "initialize did not name an absolute {key}, and {variable} is not set to one."
+        )
+    })
+}
+
+/// Opens storage in the folders `initialize` names and the local endpoint.
+fn start(params: &Value) -> Result<Service> {
+    let data = folder(params, "data_dir", "CHILPA_PLUGIN_DATA_DIR")?;
+    let cache = folder(params, "cache_dir", "CHILPA_PLUGIN_CACHE_DIR")?;
+    match (auth::Client::new(data, cache), stream::Streams::new()) {
+        (Ok(client), Ok(streams)) => Ok(Service {
+            client,
+            streams,
+            gate: RwLock::new(()),
+        }),
+        _ => bail!("Cannot initialize the Spotify plugin's private storage or local endpoint."),
+    }
 }
 
 async fn send(output: &Mutex<tokio::io::Stdout>, value: Value) -> std::io::Result<()> {
@@ -161,21 +191,10 @@ async fn run() -> Result<()> {
             let result = if service.is_some() || params["protocol"] != 1 {
                 Err(anyhow::anyhow!("Unsupported or repeated initialization."))
             } else {
-                let data = PathBuf::from(params["data_dir"].as_str().unwrap_or("/data"));
-                let cache = PathBuf::from(params["cache_dir"].as_str().unwrap_or("/cache"));
-                match (auth::Client::new(data, cache), stream::Streams::new()) {
-                    (Ok(client), Ok(streams)) => {
-                        service = Some(Arc::new(Service {
-                            client,
-                            streams,
-                            gate: RwLock::new(()),
-                        }));
-                        Ok(capabilities())
-                    }
-                    _ => Err(anyhow::anyhow!(
-                        "Cannot initialize the Spotify plugin's private storage or local endpoint."
-                    )),
-                }
+                start(&params).map(|started| {
+                    service = Some(Arc::new(started));
+                    capabilities()
+                })
             };
             let response = match result {
                 Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
@@ -230,4 +249,27 @@ async fn run() -> Result<()> {
     }
     // Tokio's stdin worker is already at EOF. Exit releases listeners and temporary audio files.
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod folder_tests {
+    use super::*;
+
+    /// A variable no environment sets, so only `initialize` can name the folder.
+    const UNSET: &str = "CHILPA_PLUGIN_TEST_FOLDER_NEVER_SET";
+
+    #[test]
+    fn a_folder_comes_from_initialize_and_is_never_guessed() {
+        let named = folder(&json!({"data_dir": "/profile/data"}), "data_dir", UNSET).unwrap();
+        assert_eq!(named, PathBuf::from("/profile/data"));
+        for params in [
+            json!({}),
+            json!({"data_dir": null}),
+            json!({"data_dir": "data"}),
+            json!({"data_dir": 7}),
+        ] {
+            let error = folder(&params, "data_dir", UNSET).unwrap_err().to_string();
+            assert!(error.contains("data_dir"), "{params}: {error}");
+        }
+    }
 }

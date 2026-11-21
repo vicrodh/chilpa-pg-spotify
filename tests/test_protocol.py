@@ -48,6 +48,13 @@ class Protocol(unittest.TestCase):
         self.assertEqual({row["id"] for row in replies}, set(range(2, 14)))
         self.assertTrue(all(row["result"]["signed_in"] is False for row in replies))
 
+    def test_genre_page_requires_a_valid_filter_and_connected_account(self):
+        self.send(2, "page.get", {"ref": "genre-discovery", "filters": {"genre": ""}})
+        self.assertEqual(self.receive()["error"]["message"], "Invalid genre name.")
+        self.send(3, "page.get", {"ref": "genre-discovery", "filters": {"genre": "Rock"}})
+        self.assertEqual(self.receive()["error"]["message"],
+                         "Connect your account in Spotify plugin settings.")
+
     def test_settings_sign_in_and_cancellation(self):
         self.send(2, "settings.open", {})
         initial = self.receive()["result"]
@@ -174,6 +181,73 @@ class Protocol(unittest.TestCase):
             self.assertIn("result", json.loads(restarted.stdout.readline()))
             restarted.stdin.close()
             restarted.wait(timeout=5)
+
+
+class Folders(unittest.TestCase):
+    """The process writes only in the folders the host names and never guesses one."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.addCleanup(self.directory.cleanup)
+        for name in ["work", "home"]:
+            (self.root / name).mkdir()
+
+    def start(self, variables=None):
+        # Not the data folder: the working directory and the home are elsewhere.
+        environment = {"PATH": "/usr/bin:/bin", "HOME": str(self.root / "home"), **(variables or {})}
+        child = subprocess.Popen([str(BINARY)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, cwd=self.root / "work", env=environment)
+        self.addCleanup(child.stderr.close)
+        self.addCleanup(child.stdout.close)
+        return child
+
+    def call(self, child, identity, method, params):
+        child.stdin.write(json.dumps({"jsonrpc": "2.0", "id": identity, "method": method, "params": params}) + "\n")
+        child.stdin.flush()
+        return json.loads(child.stdout.readline())
+
+    def finish(self, child):
+        child.stdin.close()
+        self.assertEqual(child.wait(timeout=5), 0)
+        self.assertEqual(child.stderr.read(), "")
+
+    def files(self):
+        return sorted(str(path.relative_to(self.root)) for path in self.root.rglob("*") if path.is_file())
+
+    def save_a_preference(self, child):
+        form = self.call(child, 2, "settings.open", {})["result"]
+        self.call(child, 3, "settings.submit", {"revision": form["revision"], "action": "language"})
+
+    def test_initialize_folders_hold_everything_written(self):
+        data, cache = self.root / "profile/plugin-data", self.root / "profile/plugin-cache"
+        child = self.start()
+        self.assertIn("result", self.call(child, 1, "initialize", {"protocol": 1,
+            "data_dir": str(data), "cache_dir": str(cache)}))
+        self.save_a_preference(child)
+        self.finish(child)
+        self.assertEqual(json.loads((data / "account.json").read_text())["language"], "es")
+        outside = [path for path in self.files() if not path.startswith(("profile/plugin-data/", "profile/plugin-cache/"))]
+        self.assertEqual(outside, [], "nothing is written outside the named folders")
+
+    def test_environment_names_the_folders_when_initialize_does_not(self):
+        data, cache = self.root / "variables/data", self.root / "variables/cache"
+        child = self.start({"CHILPA_PLUGIN_DATA_DIR": str(data), "CHILPA_PLUGIN_CACHE_DIR": str(cache)})
+        self.assertIn("result", self.call(child, 1, "initialize", {"protocol": 1}))
+        self.save_a_preference(child)
+        self.finish(child)
+        self.assertTrue((data / "account.json").is_file())
+
+    def test_initialize_without_absolute_folders_is_an_error(self):
+        for params in [{"protocol": 1}, {"protocol": 1, "data_dir": "plugin-data", "cache_dir": "plugin-cache"},
+                       {"protocol": 1, "data_dir": str(self.root / "data")}]:
+            child = self.start()
+            error = self.call(child, 1, "initialize", params)["error"]
+            self.assertRegex(error["message"], "data_dir|cache_dir")
+            refused = self.call(child, 2, "auth.status", {})
+            self.assertEqual(refused["error"]["message"], "Initialize the plugin first.")
+            self.finish(child)
+        self.assertEqual(self.files(), [], "no default folder was created")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+cargo fetch --locked
+cargo test --locked --offline --bin plugin
+python3 tools/build-native
+SPOTIFY_PLUGIN_BINARY="$PWD/target/release/plugin" python3 -m unittest discover -s tests -v

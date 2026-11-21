@@ -833,6 +833,9 @@ impl Client {
 
     pub async fn page(&self, params: &Value) -> Result<Value> {
         let reference = text(params, "ref");
+        if reference == "genre-discovery" {
+            return self.genre_discovery(params).await;
+        }
         if reference.starts_with("radio:") {
             let value = self
                 .radio_page(reference, params["refresh"].as_bool().unwrap_or(false))

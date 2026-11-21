@@ -56,6 +56,8 @@ pub fn document(method: &str, params: &Value, value: &mut Value, spanish: bool) 
     }
     if method.starts_with("settings.") || method == "auth.login" {
         field(&mut value["status"], "label");
+        field(&mut value["wizard"], "title");
+        labels(&mut value["wizard"]["steps"], "label");
         labels(&mut value["content"], "text");
         labels(&mut value["links"], "label");
         labels(&mut value["form"]["fields"], "label");
@@ -99,6 +101,31 @@ pub fn document(method: &str, params: &Value, value: &mut Value, spanish: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn the_stepper_and_the_numbered_instructions_are_translated() {
+        let mut page = crate::wizard::render(crate::wizard::View {
+            revision: 1,
+            account_name: "",
+            client_id: "",
+            signed_in: false,
+            playback_ready: false,
+            shared_ready: false,
+            playlist_writing: false,
+            configure: false,
+            advanced: false,
+            pending: None,
+            notice: None,
+            library_reauth: false,
+        });
+        document("settings.get", &Value::Null, &mut page, true);
+        assert_eq!(page["wizard"]["title"], "Registra Chilpa en Spotify");
+        assert_eq!(page["wizard"]["steps"][1]["label"], "Biblioteca");
+        for item in page["content"].as_array().unwrap() {
+            let line = item["text"].as_str().unwrap();
+            assert!(!line.contains("Select Create") && !line.contains("Open Spotify for Developers (link"), "{line}");
+        }
+    }
+
     #[test]
     fn english_is_default_and_spanish_preserves_provider_text_and_interpolations() {
         assert_eq!(text("For you", false), "For you");

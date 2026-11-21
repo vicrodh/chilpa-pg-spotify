@@ -415,7 +415,7 @@ impl Client {
                 };
                 let id = if id.is_empty() { WEB_CLIENT } else { id };
                 if id.len() != 32 || !id.bytes().all(|c| c.is_ascii_hexdigit()) {
-                    bail!("Invalid Web API Client ID.");
+                    bail!("That is not a Client ID. It has 32 letters and numbers and is shown on your app's page in the Spotify dashboard.");
                 }
                 self.start_flow(id.into(), false).await?;
                 *self.configure.lock().await = false;

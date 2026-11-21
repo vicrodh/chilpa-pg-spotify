@@ -296,6 +296,13 @@ impl Client {
     pub async fn get(&self, path: &str, query: &[(&str, String)]) -> Result<Value> {
         self.get_for(WebSource::Primary, path, query).await
     }
+    /// Genre pages own their snapshot, so refresh must reach the catalogue.
+    pub(crate) async fn fetch_genre_search(&self, query: &[(&str, String)]) -> Result<Value> {
+        self.request_for(
+            WebSource::Primary, Method::GET, "/search", query, None,
+            RequestKind::Catalogue(1),
+        ).await
+    }
     pub async fn get_for(
         &self,
         source: WebSource,
